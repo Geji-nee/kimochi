@@ -40,6 +40,7 @@ Headings inside a version are optional: `### Added`, `### Changed`, `### Fixed`,
 
 ### Fixed
 
+- **The line filter shows your saved choice when you reopen Settings.** Turning off **Drop lines** (previously **Filter non-Japanese text** in Auto OCR) no longer appears to reset when you leave and come back. Other Log settings also show their latest values.
 - **Adding a local account no longer freezes Kimochi.** Every window could stop responding right after the new account was added, with the Log stuck at "Loading the log…" until Kimochi was restarted.
 - **Gaming Mode on Bazzite and other non-Deck hardware: the controller menu stays open.** On a desktop PC or handheld running Bazzite's Game Mode, or a Steam Machine, the menu you open with both sticks flashed up and closed straight away. It now stays open, and Kimochi no longer pauses Steam's controller handling there, since that's how your controller reaches Kimochi. The Steam Deck works as before.
 - **Hyprland 0.57: Auto OCR no longer says the game window is minimised or out of view** while it is on the workspace you are looking at. Kimochi couldn't read how Hyprland 0.57 describes an unused special workspace, so it took every window to be on another workspace.
