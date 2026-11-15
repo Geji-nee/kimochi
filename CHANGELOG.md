@@ -8,6 +8,8 @@ Headings inside a version are optional: `### Added`, `### Changed`, `### Fixed`,
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-15
+
 ### Added
 
 - **⭐ Read in other languages!** Pick the language you're learning in Settings → Language. This is experimental, since Kimochi was built originally for Japanese-only. So feedback is welcome.
