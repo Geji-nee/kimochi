@@ -1462,8 +1462,9 @@ normally means the browser is closed, the setting is off, or the browser suspend
 | `yomitan_api_check` | `({url}) -> ApiStatus` |
 | `install_yomitan_native_host` | `() -> string` (the installer's output) |
 | `yomitan_probe` | `({baseUrl}) -> latencyMs` (the Log's reader: a `/tokenize` round trip) |
-| `yomitan_prefetch` | the API pop-up's Shift-scan, as soon as it knows the word under the pointer: `yomitan_prefetch({baseUrl, term})` starts fetching the word's entries (without media), and `show_popover` opens on that answer rather than asking again. Entries are kept for a minute (`reader/yomitan.rs` `ENTRIES_KEPT`); a request still on its way is shared |
-| `yomitan_tokenize`, `yomitan_ankifields` | the API pop-up's Shift-scan, in the Log and the overlay (`ui/scan-text.ts`), and its entries. `yomitan_ankifields({baseUrl, text, includeMedia?, maxEntries?})`: `maxEntries` (1–32, default 32) returns only the first entries. With media, Yomitan fetches every returned entry's audio, trying its audio sources in turn (online ones too), which takes seconds for a common word; the pop-up asks for the first entry's media alone (`maxEntries: 1`, tens of milliseconds) so its audio plays at once, and every entry's in the background |
+| `yomitan_prefetch` | the API pop-up's Shift-scan, as soon as it knows the word under the pointer: `yomitan_prefetch({baseUrl, term})` starts fetching the word's first entries (`reader/yomitan.rs` `FIRST_ENTRIES`, without media), and `show_popover` opens on that answer rather than asking again. Entries are kept for a minute (`ENTRIES_KEPT`); a request still on its way is shared. Lookups take turns, one at a time per API address (`Lane`): a prefetch whose turn comes after a newer one was asked, for a word the newest pop-up isn't showing, is dropped without being sent, and so is a pop-up's lookup once a newer pop-up has opened at its level. `show_popover` then asks for every entry once the pop-up has stayed 200 ms (`ALL_SETTLE`), and every entry's media 600 ms after that (`MEDIA_SETTLE`) |
+| `yomitan_warm` | the overlay, when Settings → Dictionary's **Pre-fetch lookups** is on (`yomitanSettings.prefetchScreen`, off by default; Yomitan API engine only): `yomitan_warm({baseUrl, texts})` with the overlay's boxes once they have stayed unchanged 300 ms. In the background it parses each box with one `/tokenize` and fetches each word's first entries into the same cache, at most 80 words and 1200 characters. Every request waits until the lane is free and the reader's own requests (tokenize, prefetch, pop-up) have been quiet for 250 ms (`WARM_IDLE`), and a newer call stops an older one at its next step |
+| `yomitan_tokenize`, `yomitan_ankifields` | the API pop-up's Shift-scan, in the Log and the overlay (`ui/scan-text.ts`), and its entries. `yomitan_tokenize`'s answer keeps each headword's `term`, `reading` and `sources` only (`trim_tokenize`): Yomitan also sends every frequency and pitch dictionary's data on every candidate headword, hundreds of KB for a 16-character window with many dictionaries. `yomitan_ankifields({baseUrl, text, includeMedia?, maxEntries?})`: `maxEntries` (1–32, default 32) returns only the first entries. With media, Yomitan fetches every returned entry's audio, trying its audio sources in turn (online ones too), which takes seconds for a common word; the pop-up asks for the first entry's media alone (`maxEntries: 1`, tens of milliseconds) so its audio plays at once, and every entry's in the background |
 
 `yomitan_host_status` only reads. It looks for `yomitan_api.json` in every browser's
 `NativeMessagingHosts` folder (macOS `~/Library/Application Support/<Google/Chrome, Chromium,
@@ -1472,8 +1473,10 @@ BraveSoftware/Brave-Browser, Microsoft Edge, Vivaldi, Arc/User Data, Mozilla>`; 
 `~/.mozilla/native-messaging-hosts`), and on Windows reads the default value of
 `HKCU\Software\<Google\Chrome | Chromium | BraveSoftware\Brave-Browser | Microsoft\Edge | Vivaldi |
 Mozilla>\NativeMessagingHosts\yomitan_api` (`reg query`) and reads the manifest it names.
-`HostStatus` is `{os, installed, method, browsers: [{browser, browserName, manifestPath, hostPath,
-method, hostExists, problem}]}`. `method` is classified from the program the manifest names:
+`HostStatus` is `{os, installed, method, kimochiOutdated, browsers: [{browser, browserName,
+manifestPath, hostPath, method, hostExists, problem, current}]}`. `current` (Kimochi's helper only)
+says whether its program's sha256 is the pinned `HOST_VERSION` asset's; `kimochiOutdated` is true
+when a working registration's is not. `method` is classified from the program the manifest names:
 `'official'` (yomidevs/yomitan-api: `yomitan_api.py`, or its `yomitan_api.bat` wrapper),
 `'kimochi'` (the Go helper: `yomitan-host-*`, `go-yomitan-native-messaging-host`) or `'unknown'`;
 it is null when the manifest cannot be read as a `yomitan_api` manifest. `installed` is true when
@@ -1482,19 +1485,30 @@ the official one.
 
 `yomitan_api_check` POSTs `/serverVersion` (answered by the helper itself, 1.5 s timeout), then
 `/yomitanVersion` (a round trip into the extension, 4 s): `ApiStatus` is `{url, server, yomitan,
-yomitanVersion, latencyMs, error}`. Connection failures are answers, not errors; only an address
+yomitanVersion, hostName, hostVersion, concurrent, latencyMs, error}`. The middle three are what
+the running helper says it is on `/serverVersion`: Kimochi's helper from v3 answers
+`{"version":1,"host":"kimochi","hostVersion":"v3","concurrent":true}`; older ones and the official
+helper answer `{"version":1}`, so they read null, null, false. The setup uses them to tell a browser
+still running an old helper (restart it) from one running the current one. Connection failures are answers, not errors; only an address
 `validate_configured_api_url` refuses (`invalid:`) rejects. Not callable from `overlay`, like
 `yomitan_request`. The setup wizard calls it every second while it is open (never overlapping),
 Settings → Dictionary every five seconds.
 
-`install_yomitan_native_host` is the only command that writes registrations, and only runs from
-the wizard's Install button. It downloads the latest release asset `yomitan-host-<os>-<arch>` of
-[hamstu/go-yomitan-native-messaging-host](https://github.com/hamstu/go-yomitan-native-messaging-host).
+`install_yomitan_native_host` is the only command that writes registrations. It runs from the
+wizard's Install button, Settings → Dictionary's "Use Kimochi's helper" / "Update helper", and once
+at startup when a working registration runs an older Kimochi helper (`update_if_outdated`; other
+installers' helpers are never replaced unasked). It downloads the release asset
+`yomitan-host-<os>-<arch>` of the pinned version (`reader/yomitan_install.rs` `HOST_VERSION`) of
+[hamstu/go-yomitan-native-messaging-host](https://github.com/hamstu/go-yomitan-native-messaging-host)
+and refuses it unless its sha256 is the one pinned for that asset (`HOST_SHA256`, from the release's
+`SHA256SUMS`).
 On macOS and Linux the binary's own `install` copies it into every browser's folder and writes the
 manifests there; the download is then deleted. On Windows Kimochi keeps the binary at
 `<app local data>/yomitan-host/yomitan-host.exe`, writes `yomitan_api.json` (Chromium
 `allowed_origins`) and `yomitan_api_firefox.json` (Firefox `allowed_extensions`) beside it, and
-sets each browser's `HKCU` key above with `reg add`.
+sets each browser's `HKCU` key above with `reg add`. A running `yomitan-host.exe` (the browser has
+it open) is renamed to `.exe.old` and the new one renamed into place; the browser runs the new one
+the next time it starts the helper.
 
 ## AnkiConnect
 

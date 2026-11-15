@@ -119,6 +119,17 @@ export function DictionaryTab(): ReactNode {
             value={yomitanSettings.customApiUrl}
             onSave={(value) => void setYomitanSettings({ ...yomitanSettings, customApiUrl: value })}
           />
+          <SettingsRow
+            label="Pre-fetch lookups"
+            controlId="dictionary-api-prefetch"
+            description="Starts looking up words in the background before you hover, to speed up the pop-up. May use more CPU."
+          >
+            <Switch
+              id="dictionary-api-prefetch"
+              checked={yomitanSettings.prefetchScreen === true}
+              onCheckedChange={(on) => void setYomitanSettings({ ...yomitanSettings, prefetchScreen: on })}
+            />
+          </SettingsRow>
         </SettingsSection>
         <WithReaderSettings>{(settings) => <KimochiPopupSections settings={settings} />}</WithReaderSettings>
       </>

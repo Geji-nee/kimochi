@@ -39,6 +39,8 @@ export function dismissApiLookup() {
 }
 
 const WORD_BOX = '[data-ocr-word-box]'
+/** How long the overlay's boxes must stay unchanged before their words are warmed. */
+const WARM_SETTLE_MS = 300
 
 /** AnkiConnect's address when the setting has none (ankiconnect.rs `DEFAULT_URL`). */
 const DEFAULT_ANKI_CONNECT_URL = 'http://127.0.0.1:8765'
@@ -60,6 +62,23 @@ export function popupAnkiConfig(reader) {
     mappings: Array.isArray(reader.ankiFieldMappings) ? reader.ankiFieldMappings : [],
     // Card enhancement's tags are added in Rust (anki_add_note), for every dictionary.
     tags: []
+  }
+}
+
+/**
+ * The pop-up's audio from the reader settings, with the defaults the Log's settings fill in
+ * (`SETTINGS_DEFAULTS` in frontend/texthooker/lib/types.ts): audio on, autoplay on, volume 0.9.
+ * Reader settings are saved only once something in them is changed, so a key never touched is
+ * absent here, and Settings shows its default (Fetch word audio on). Reading the raw value made
+ * the overlay's pop-up skip audio until mining was turned on.
+ */
+export function popupAudio(reader) {
+  const audioEnabled = reader?.audioEnabled ?? true
+  const audioAutoplay = reader?.audioAutoplay ?? true
+  return {
+    includeMedia: Boolean(audioEnabled || reader?.ankiEnabled),
+    audioAutoplay: Boolean(audioEnabled && audioAutoplay),
+    audioVolume: typeof reader?.audioVolume === 'number' ? reader.audioVolume : 0.9
   }
 }
 
@@ -108,9 +127,7 @@ export async function installApiLookup({ embedded = true, onVisibilityChange = (
         baseUrl: baseUrl(),
         focus,
         sentence,
-        includeMedia: Boolean(reader.audioEnabled || reader.ankiEnabled),
-        audioAutoplay: Boolean(reader.audioEnabled && reader.audioAutoplay),
-        audioVolume: reader.audioVolume ?? 0.9,
+        ...popupAudio(reader),
         ankiConfig: popupAnkiConfig(reader)
       })
     } catch (error) {
@@ -141,10 +158,40 @@ export async function installApiLookup({ embedded = true, onVisibilityChange = (
     if (!apiMode()) scanner.stop()
   }
   update()
+  // New text on the overlay: its words' first entries are fetched while the reader isn't looking
+  // anything up (`yomitan_warm`), so pointing at one opens from the cache. Boxes in document
+  // order; the same text twice (automatic OCR redraws) is warmed once.
+  let warmed = ''
+  let warmTimer = null
+  const warmBoxes = () => {
+    warmTimer = null
+    if (!apiMode() || settings?.prefetchScreen !== true) return
+    const texts = [...document.querySelectorAll(WORD_BOX)]
+      .map((box) => (box.renderText ?? box.querySelector('.ocr-word-current')?.textContent ?? '').trim())
+      .filter(Boolean)
+    const key = texts.join('\n')
+    if (!key || key === warmed) return
+    warmed = key
+    void invoke('yomitan_warm', { baseUrl: baseUrl(), texts }).catch(() => {})
+  }
+  // (Absent where tests run the overlay without a DOM.)
+  if (globalThis.MutationObserver) {
+    new MutationObserver(() => {
+      clearTimeout(warmTimer)
+      warmTimer = setTimeout(warmBoxes, WARM_SETTLE_MS)
+    }).observe(document.body, { childList: true, subtree: true })
+  }
+
   await window.__TAURI__.event.listen('settings:changed', ({ payload }) => {
     if (payload.key === 'yomitanSettings') {
+      const warmingTurnedOn = payload.value?.prefetchScreen === true && settings?.prefetchScreen !== true
       settings = payload.value
       update()
+      // Turned on: the text already on screen is warmed now, not with the next line.
+      if (warmingTurnedOn) {
+        warmed = ''
+        warmBoxes()
+      }
       if (!apiMode()) void invoke('hide_popover')
     }
     if (payload.key === 'superTexthooker') reader = payload.value || {}
