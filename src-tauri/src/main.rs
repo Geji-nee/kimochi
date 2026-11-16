@@ -5023,7 +5023,7 @@ fn spawn_source_watch(handle: tauri::AppHandle, service: Shared) {
 }
 
 fn source_state_payload(source_id: &str, state: &platform::WindowState) -> Value {
-    json!({
+    let payload = json!({
         "sourceId": source_id,
         "bounds": state.bounds,
         "onScreen": state.on_screen,
@@ -5031,7 +5031,16 @@ fn source_state_payload(source_id: &str, state: &platform::WindowState) -> Value
         "settling": state.settling,
         "display": state.display,
         "scaled": state.scaled,
-    })
+    });
+    #[cfg(target_os = "linux")]
+    let payload = {
+        let mut payload = payload;
+        if let Some(available) = platform::native::geometry_available(source_id) {
+            payload["geometryAvailable"] = json!(available);
+        }
+        payload
+    };
+    payload
 }
 
 /// The tracked window's state as last announced by `source-bounds`, or null when no window is

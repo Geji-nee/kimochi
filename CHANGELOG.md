@@ -23,6 +23,9 @@ Headings inside a version are optional: `### Added`, `### Changed`, `### Fixed`,
 - Hachidori is updated to 0.5.2: it understands older and literary Japanese conjugations (思ふ, 食べてゐる, 食べやしない), common in visual novels, splits headword furigana per kanji, and can add a card to Anki without waiting for its duplicate check. It downloads once more (about 7 MB) and keeps your dictionaries and settings.
 - Built-in Yomitan is updated to 26.11.2.0: word audio from a local audio server releases the sound device once it has played, and the Anki card settings show the right fields for kanji cards. It downloads once more (about 15 MB) and keeps your dictionaries and settings.
 - 10ten is updated to 1.29.0: it can read a word aloud, with each sound highlighted as it plays (turn it on under Audio in 10ten's settings), <kbd>P</kbd> plays the reading or a kanji's stroke order, and damaged dictionary data can be downloaded again without losing your settings. It downloads once more (about 18 MB).
+- **Niri window capture.** Select individual windows, follow them with the overlay when Niri supplies window positions, and use Text hooking with identifiable Wine/Proton games through xwayland-satellite.
+- **Text hooking with NixOS Steam.** Hook helpers can reach games launched with a private Wine session. This requires `nsenter` from util-linux.
+- **Dictionary popups on Niri.** Automatic-hover popups close when the pointer leaves the text and dictionary.
 
 ## [1.0.0] - 2026-11-15
 
