@@ -8,6 +8,12 @@ Headings inside a version are optional: `### Added`, `### Changed`, `### Fixed`,
 
 ## [Unreleased]
 
+- **📊 New Stats tab.** See your reading at a glance: a heatmap with streaks, characters and time per day, reading speed, when in the day you read, each session's totals and the kanji you've read most. Pick which sessions to include from the session menu at the bottom right (all of them by default).
+- **Your reading history is kept.** Kimochi now keeps every line you read, with when you read it and which game or session it came from, even after you clear the Log or turn off saved images and audio. Lines already in your Log are included. Export it from the Log's **⋯** menu as a CSV that exSTATic and GameSentenceMiner can import, or as a full CSV or JSON file. With Sync on, it follows you across your computers.
+- **Character counts now match GameSentenceMiner and exSTATic.** Punctuation, symbols and spaces no longer count, so your characters and chars/hour line up with other reading trackers. Totals from before stay as they were.
+- **Smarter reading time.** Each line now counts until the next one, up to about 2.5 times what a line its length usually takes you, so a short line before a break no longer adds a whole minute, and a long line you read slowly keeps its time. Settings → Log → **Max time per line** caps how long one line can count (5 minutes by default).
+- **Skipping doesn't count.** Lines that fly by faster than you could read them (three or more long lines under a second apart) add no characters, lines or time. Turn this off in Settings → Log → **Ignore skipped lines**.
+- **Choose when your day starts** (Settings → Log → **Day starts at**, 4 am by default), so late-night reading counts toward the day it began. Reading speed shows once you've read 5 lines.
 - **Controllers on Windows:** an Xbox controller (or one that works like it) is now read with XInput automatically, so its buttons register even when Windows listed it but never passed on a press, and while a game is in front. The "Read controllers with XInput" switch is gone.
 - Performance fixes and improvements, with more reliable setup, source selection, translations, audio playback and keyboard navigation.
 

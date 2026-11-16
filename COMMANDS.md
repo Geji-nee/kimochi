@@ -697,6 +697,11 @@ without a CFRunLoop has not been tested in-app.
 | `history_delete` | `({id}) -> ()` |
 | `history_clear` | `() -> ()` |
 | `log_recent` | `({limit?}) -> [{id, text, timestamp, source}]` — the Log's newest lines (open session's `lines.json`, newest first, default 50), whatever their source; the controller's Recent text |
+| `reading_history_append` | `({events: [{op, uid, at, ts?, text?, originalText?, via?, engine?, session?, sessionName?, source?: {window?, app?, exe?}, language?, tz?}]}) -> number` — the Log's lines read, for the reading history; returns how many were kept |
+| `reading_history_summary` | `() -> {lines, chars, first, last}` |
+| `reading_history_stats` | `({idleSec?, skipFastLines?, dayStartHour?, tz?}) -> {sessions: [{id, name}], buckets: [{day, session, hour, chars, ms, lines, last}]}` — the Stats tab's reading, summed by reading day, session and local hour by the reading-time rule; `tz`: this computer's zone, for backfilled lines from before the history kept zones |
+| `reading_history_kanji` | `({sessions?, since?, limit?, idleSec?, skipFastLines?, dayStartHour?, tz?}) -> {…, top: [{kanji, count, fresh}]}` — the kanji read in `sessions` (all when absent) from reading day `since`: how many, how many new, and the `limit` (default 60, at most 500) most read |
+| `reading_history_export` | `({path, format, idleSec?, skipFastLines?, dayStartHour?}) -> number` — `format`: `json`, `csv`, `exstatic-lines`, `exstatic-stats`; the reading-time settings (defaults 300, true, 4); returns the lines written |
 | `ext_relay` | `({target \| null, payload}) -> ()` |
 | `yomitan_request` | `({url, body}) -> Value` |
 | `tts_speak` | `({text, voiceId}) -> ArrayBuffer` (audio) |
@@ -712,6 +717,52 @@ stalled client cannot freeze publishing or a settings change.
 History add/delete go through Rust with the 50-entry cap applied there, so the overlay
 and the Log panel cannot race each other with read-modify-write cycles on one key. Each
 change re-emits `settings:changed` for `scannedTextHistory`.
+
+**Reading history** (`reading_history.rs`) is every line read, kept for stats and export apart
+from the Log's transcript, which the person trims (Max lines), clears and moves between sessions.
+The Log (`frontend/texthooker/core/history.ts`) reports each line it logs (`add`), each change to
+its text (`edit`: a fuller reading, or Edit line) and each line deleted from it (`delete`: a
+misreading, or fragments a fuller reading replaced), in batches a second apart and on every Log
+flush. Notes are not reading and are never sent. Native appends them to
+`<profile>/reading-history/YYYY-MM.jsonl` (UTC month of `at`, one JSON object per line, only ever
+appended to) and folds them by `uid` when read: the latest text wins, the first `ts` stays, and a
+`delete` drops the line. Clearing the Log, its line limit, deleting a session and screenshot or
+audio retention never remove history. The first call in a profile copies every session's
+`lines.json` into `backfill.jsonl` (lines marked `backfilled`; a live record of the same `uid`
+wins); that file's presence means the backfill ran. A profile copied into an account takes its
+history with it (`profile::copy_profile_data`). Sync carries it as the `history` collection:
+each computer pushes only its own events, as chunks of one file's events from one UTC hour (at
+most 50 events and 192 KB: `<device>/<YYYYMMDDHH>.<n>`, `b…` from the backfill), so a new line
+changes only the last chunk of its hour; other computers' chunks are kept as they arrive in
+`reading-history/devices/<device>/<chunk>.json`, never pushed back, and fold in with this
+computer's events in the order they were made. A line deleted on one computer is gone from the
+history on all of them.
+
+Characters are counted by one rule everywhere, the Log's footer included (`countChars`,
+`frontend/texthooker/core/charCount.ts`, and `reading_history::count_chars`): every code point but
+Unicode punctuation, symbols, separators and control characters, as GameSentenceMiner and
+exSTATic count (GSM also counts line breaks inside a line; exSTATic also counts `!`, `・`, `〜`
+and emoji).
+
+Export (the Log's ⋯ → Export reading history) writes: `exstatic-lines`, exSTATic's lines CSV
+`uuid,given_identifier,name,line,time` (BOM, `time` in epoch seconds; `uuid` is the session id,
+`given_identifier` the hooked game's executable or else the session name), which exSTATic imports
+and GameSentenceMiner's exSTATic import reads; `exstatic-stats`, exSTATic's stats CSV per session
+and local day (`chars_read` by the rule above, `time_read` seconds), which names the media in
+exSTATic; `csv` and `json`, every field, with `read_ms` and `skipped`.
+
+**Reading time, skipping and days** follow one rule everywhere: the footer (live), the session
+list, the exports and the Stats tab (`frontend/texthooker/lib/readingTime.ts`, natively
+`reading_history::credit`; `scripts/fixtures/reading-time.json` holds the cases both are tested
+with). A line counts the time until the next line, at most 2.5 × what a line its length takes at
+the session's slower pace (the 25th percentile of characters a second of its last 200 lines of 5+
+characters followed by a 1–300 s gap; 3 s a character before 5 are measured), between 2 s and
+`idleSec` (`afkThresholdSec`, "Max time per line", default 300). The live footer's clock
+stops when the last line's allowance runs out, so it never runs backwards. With "Ignore skipped
+lines" on (`skipFastLines`, default), three or more lines of 12+ characters each under a second
+apart were skipped: no characters, lines or time (the footer takes back the run's first lines when
+the third arrives). A reading day starts at "Day starts at" (`dayStartHour`, 0–6, default 4) local
+time (`readingDay`, `reading_day`). The footer shows a speed once 5 lines are counted.
 
 `ext_relay_listen` registers a Tauri `Channel` for the calling window. Native forgets it when
 that window's page starts loading again (reload or navigation) and when the window closes, so a
