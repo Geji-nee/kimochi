@@ -144,8 +144,15 @@ fn captures_key(owned: bool, down: bool, was_down: bool, modal: bool, hover: boo
 /// Quick Shot has a display, not a source HWND. Its editing keys must still reach the
 /// selector while a foreign application owns the keyboard. Keep ordinary typing and
 /// system escape routes subject to the existing focus policy.
-fn region_key_target(region: bool, key: u32, source: bool) -> bool {
-    source || region && matches!(key, 13 | 27 | 32)
+///
+/// The controller menu's keys (arrows, Return, Escape, Space) likewise, whatever is in front:
+/// opened from the keyboard, the game can keep the foreground (the overlay's activation is not
+/// guaranteed), and with no scanned text on screen no target names the game's window either, so
+/// the keys went to the game and the menu could not be driven. As macOS's global
+/// shortcuts do, they are Kimochi's while the menu is open; navigation ends by itself when
+/// another application comes to the front (`gamepad::release_if_elsewhere`).
+fn modal_key_target(region: bool, nav: bool, key: u32, source: bool) -> bool {
+    source || region && matches!(key, 13 | 27 | 32) || nav && key_name(key).is_some()
 }
 
 /// Whether a hover may take the foreground: only with controller buttons held, never for
@@ -294,7 +301,21 @@ fn update_hover_focus(app: &tauri::AppHandle) {
                     }
                 } else if let Some((source, owner)) = previous.take() {
                     if foreground.0 as usize == owner {
-                        super::window::restore_input_focus(HWND(source as *mut _));
+                        let pid = super::window_pid(HWND(source as *mut _));
+                        if crate::game_pause::app::holds_pid(pid) {
+                            // A paused game runs again before it gets the keyboard back (the hand-off
+                            // waits on its input thread); off the main thread, as the wait may be long.
+                            let later = handle.clone();
+                            std::thread::spawn(move || {
+                                if crate::game_pause::app::resume_before_activating("hover lease ended") {
+                                    let _ = later.run_on_main_thread(move || {
+                                        super::window::restore_input_focus(HWND(source as *mut _));
+                                    });
+                                }
+                            });
+                        } else {
+                            super::window::restore_input_focus(HWND(source as *mut _));
+                        }
                     }
                 }
                 HOVER_LEASE.store(previous.is_some(), Ordering::Relaxed);
@@ -468,7 +489,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                     region || nav,
                     hover,
                     ours,
-                    region_key_target(region, key, source),
+                    modal_key_target(region, nav, key, source),
                 ) {
                     return false;
                 }
@@ -507,16 +528,36 @@ mod tests {
         // Quick Shot leaves the game focused and its full-display target has source == 0.
         // Previously Escape was delivered to that game, leaving the selector stuck open.
         for key in [13, 27, 32] {
-            let target = region_key_target(true, key, false);
+            let target = modal_key_target(true, false, key, false);
             assert!(captures_key(false, true, false, true, false, false, target));
             // Closing the selector on key-down must not leak the matching release.
             assert!(captures_key(true, false, true, false, false, false, false));
-            assert!(!captures_key(false, true, false, false, false, false, region_key_target(false, key, false)));
+            assert!(!captures_key(false, true, false, false, false, false, modal_key_target(false, false, key, false)));
         }
         for key in [9, 18, 65, 91, 162] {
             assert!(
-                !captures_key(false, true, false, true, false, false, region_key_target(true, key, false)),
+                !captures_key(false, true, false, true, false, false, modal_key_target(true, false, key, false)),
                 "foreign app keeps key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_menu_keys_work_while_the_game_keeps_the_foreground() {
+        // Opened from the keyboard: the game is in front (not ours), no scanned text names its
+        // window (source false). Every menu key is captured and its release follows.
+        for key in [13, 27, 32, 37, 38, 39, 40] {
+            let target = modal_key_target(false, true, key, false);
+            assert!(captures_key(false, true, false, true, false, false, target), "menu key {key}");
+            assert!(captures_key(true, false, true, false, false, false, false), "release of {key}");
+            // Menu closed: the game gets the key again.
+            assert!(!captures_key(false, true, false, false, false, false, modal_key_target(false, false, key, false)));
+        }
+        // Ordinary typing and the OS's escape routes stay the game's while the menu is open.
+        for key in [9, 18, 65, 91, 162] {
+            assert!(
+                !captures_key(false, true, false, true, false, false, modal_key_target(false, true, key, false)),
+                "game keeps key {key}"
             );
         }
     }

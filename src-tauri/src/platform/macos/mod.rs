@@ -678,6 +678,39 @@ pub fn window_bounds(id: &SourceId) -> Option<(Rect, bool)> {
     }
 }
 
+/// Game pause: whether window source `id` still exists as a window of the process it names, so a
+/// game that closed (whose pid will soon be free) is never planned. Minimised windows, windows on
+/// another Space and full-screen windows count: `window_bounds`' single-window query returns
+/// nothing for a minimised or ordered-out window, so this reads the full list instead (once per
+/// plan, not per frame).
+pub fn game_window_open(id: &SourceId) -> bool {
+    if !id.is_window() || !id.is_local() {
+        return false;
+    }
+    let (Some(window_number), Some(pid)) = (id.handle_u32(), id.pid()) else {
+        return false;
+    };
+    objc2::rc::autoreleasepool(|_| unsafe {
+        // kCGWindowListOptionAll: every window, on screen or not.
+        let ptr = CGWindowListCopyWindowInfo(0, 0);
+        if ptr.is_null() {
+            return false;
+        }
+        let Some(list): Option<Retained<objc2_foundation::NSArray<NSDictionary<NSString, AnyObject>>>> =
+            Retained::from_raw(ptr.cast())
+        else {
+            return false;
+        };
+        list.iter().any(|entry| {
+            let number = |key: &NSString| -> Option<f64> {
+                entry.objectForKey(key).map(|value| msg_send![&*value, doubleValue])
+            };
+            number(ns_string!("kCGWindowNumber")) == Some(f64::from(window_number))
+                && number(ns_string!("kCGWindowOwnerPID")) == Some(f64::from(pid))
+        })
+    })
+}
+
 /// The window the reader is actually working in: the frontmost ordinary window **of
 /// the frontmost application**.
 ///
@@ -1141,6 +1174,10 @@ fn put_back(app: &NSApplication) {
 /// controller menu hands the keyboard back to the game without raising the application's other
 /// windows over it, such as an emulator's library. Activating the application is the fallback.
 pub fn activate_process(pid: u32) -> Result<(), String> {
+    // Never activated while paused (callers resume it first, `resume_before_activating`).
+    if crate::game_pause::app::holds_pid(pid) {
+        return Err("busy: the game is paused".into());
+    }
     if let Ok(process) = i32::try_from(pid) {
         if let Some((number, _)) = front_window_number(process).filter(|(number, _)| *number != 0) {
             if focus::front_only(process, number, &mut serde_json::Map::new()) {
@@ -1187,7 +1224,12 @@ pub fn window_fullscreen(id: &SourceId) -> Option<bool> {
     if let Some(spaces) = spaces::Spaces::current() {
         return Some(spaces.is_full_screen(number));
     }
-    focus::is_full_screen(i32::try_from(id.pid()?).ok()?, number)
+    let pid = id.pid()?;
+    // Accessibility waits on the app (up to 0.5 s, on the main thread): never on a paused game.
+    if crate::game_pause::app::holds_pid(pid) {
+        return None;
+    }
+    focus::is_full_screen(i32::try_from(pid).ok()?, number)
 }
 
 /// Bring window source `id` to the front: that window, not just its application, switching to
@@ -1201,6 +1243,10 @@ pub fn activate_window(id: &SourceId) -> Result<Value, String> {
         return Ok(Value::Object(report));
     };
     let process = i32::try_from(pid).map_err(|_| "invalid: process id out of range")?;
+    // Never raised or activated while paused (callers resume it first, `resume_before_activating`).
+    if crate::game_pause::app::holds_pid(pid) {
+        return Err("busy: the game is paused".into());
+    }
     // The window itself first, so it is its application's front window before anything
     // activates the application: activated with another of its windows on the Space being
     // shown (OpenEmu's library, beside its game in full screen), macOS stays on that Space.

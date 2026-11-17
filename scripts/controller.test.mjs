@@ -11,6 +11,7 @@ import {
   REPEAT_DELAY_MS,
   REPEAT_RATE_MS,
   buttonName,
+  pageMenuKey,
   stickDirection
 } from '../ui/controller-input.js'
 import {
@@ -600,4 +601,56 @@ test('a place in a box drawn as several text nodes is in the node that holds it'
   assert.equal(offsetInNodes(nodes, nodes[2], 3), 8)
   assert.equal(offsetInNodes(nodes, nodes[0], 0), 0)
   assert.equal(offsetInNodes(nodes, { length: 3 }, 1), -1)
+})
+
+/** A page key event as the overlay's capture listener sees it. */
+function keyEvent(key, { type = 'keydown', trusted = true, target = { tagName: 'BODY' }, repeat = false } = {}) {
+  return { key, type, isTrusted: trusted, repeat, target, composedPath: () => [target] }
+}
+
+test('Windows page keys: the menu takes its seven keys while it is open, and only then', () => {
+  const open = { os: 'windows', mode: 'menu' }
+  for (const key of ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'Escape', ' ']) {
+    assert.deepEqual(pageMenuKey(keyEvent(key), open), { key, type: 'keydown' })
+    assert.deepEqual(pageMenuKey(keyEvent(key, { type: 'keyup' }), open), { key, type: 'keyup' })
+    assert.equal(pageMenuKey(keyEvent(key), { os: 'windows', mode: 'idle' }), null, `${key}: menu closed`)
+    assert.equal(pageMenuKey(keyEvent(key), { os: 'windows', mode: undefined }), null, `${key}: no controller`)
+    for (const os of ['macos', 'linux']) assert.equal(pageMenuKey(keyEvent(key), { os, mode: 'menu' }), null, os)
+  }
+  for (const mode of ['words', 'dictionary', 'history'])
+    assert.ok(pageMenuKey(keyEvent('Enter'), { os: 'windows', mode }))
+  // Typing and the OS's keys are never the menu's.
+  for (const key of ['a', 'Tab', 'Alt', 'Control', 'Backspace'])
+    assert.equal(pageMenuKey(keyEvent(key), open), null, key)
+})
+
+test('Windows page keys: never from a field being typed in, a synthetic event or the region editor', () => {
+  const open = { os: 'windows', mode: 'menu' }
+  for (const target of [
+    { tagName: 'INPUT' },
+    { tagName: 'textarea' },
+    { tagName: 'SELECT' },
+    { isContentEditable: true }
+  ])
+    assert.equal(pageMenuKey(keyEvent('ArrowLeft', { target }), open), null, JSON.stringify(target))
+  // The region editor relays its native keys as synthetic events, and owns Return, Escape and Space.
+  assert.equal(pageMenuKey(keyEvent('Escape', { trusted: false }), open), null)
+  assert.equal(pageMenuKey(keyEvent('Enter'), { ...open, regionSelecting: true }), null)
+})
+
+test('Windows page keys: a held arrow steps once per repeated keydown and its keyup steps nothing, as from the hook', () => {
+  const { commands, controls } = input()
+  const open = { os: 'windows', mode: 'menu' }
+  for (const event of [
+    keyEvent('ArrowDown'),
+    keyEvent('ArrowDown', { repeat: true }),
+    keyEvent('ArrowDown', { repeat: true }),
+    keyEvent('ArrowDown', { type: 'keyup' })
+  ])
+    controls.key(pageMenuKey(event, open))
+  assert.deepEqual(
+    commands.filter((c) => c.type === 'dir'),
+    [1, 2, 3].map(() => ({ type: 'dir', dir: 'down', source: 'key', repeat: false }))
+  )
+  assert.equal(commands.length, 3)
 })

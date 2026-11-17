@@ -433,6 +433,11 @@ pub fn promote_to_key(w: &tauri::WebviewWindow) -> Result<bool, String> {
 /// foreground right. Detached immediately: an attached queue shares key state and would
 /// stall us if that thread hung.
 fn force_foreground(target: HWND) -> bool {
+    // A paused game is never the target (callers resume it first): `foreground_ready` would wait
+    // out its timeout on a window that cannot answer.
+    if crate::game_pause::app::holds_pid(window_pid(target)) {
+        return false;
+    }
     unsafe {
         // Lets whichever process we hand the foreground to keep it (activate_process).
         let _ = AllowSetForegroundWindow(ASFW_ANY);
@@ -441,6 +446,13 @@ fn force_foreground(target: HWND) -> bool {
             return true;
         }
         let foreground = GetForegroundWindow();
+        // Never share an input queue with a paused game's thread: with the queues attached, taking
+        // the foreground deactivates the game's window synchronously, and a suspended thread never
+        // answers. Without the attach the request may only flash the taskbar button; a click on
+        // Kimochi's own window (which grants the foreground) still works.
+        if !foreground.is_invalid() && crate::game_pause::app::holds_pid(window_pid(foreground)) {
+            return foreground_ready(target);
+        }
         let theirs = if foreground.is_invalid() { 0 } else { GetWindowThreadProcessId(foreground, None) };
         let ours = GetCurrentThreadId();
         // Without a shared queue, handing the foreground back from one of our own windows
@@ -729,6 +741,11 @@ pub fn activate_self(prefer: Option<&tauri::WebviewWindow>) -> Result<(), String
 /// Kimochi is normally the foreground app when this is asked for (the reader just
 /// clicked it), which is what lets Windows honour the request.
 pub fn activate_process(pid: u32) -> Result<(), String> {
+    // Never a paused game (callers resume it first, `game_pause::app::resume_before_activating`):
+    // Windows never marks a frozen window hung, so the foreground hand-off would wait on it.
+    if crate::game_pause::app::holds_pid(pid) {
+        return Err("busy: the game is paused".into());
+    }
     let Some(target) = main_window_of(pid) else {
         return Err(if super::process_image_path(pid).is_none() && process_windows(pid).is_empty() {
             "gone: that application is no longer running".into()
@@ -753,6 +770,9 @@ pub fn activate_process(pid: u32) -> Result<(), String> {
 /// desktop is activated there, and Windows switches to that desktop. Falls back to the process
 /// when the window is gone.
 pub fn activate_window(id: &kimochi_capture::SourceId) -> Result<Value, String> {
+    if id.pid().is_some_and(crate::game_pause::app::holds_pid) {
+        return Err("busy: the game is paused".into());
+    }
     let Some(target) = super::sources::resolve(id) else {
         return match id.pid().filter(|pid| *pid > 0) {
             Some(pid) => activate_process(pid).map(|()| json!({ "fallback": true })),

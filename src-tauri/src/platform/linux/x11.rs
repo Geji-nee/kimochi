@@ -118,6 +118,15 @@ pub fn picker_sources() -> Result<Vec<Source>, String> {
     Ok(d.sources(std::process::id()))
 }
 
+/// Game pause: whether window source `id` is still open as the process it was listed for (a
+/// minimised window counts). The id's pid is compared with the window's, since a closed client's
+/// window ids and X-Resource slot are handed to the next client.
+pub fn window_open(id: &SourceId) -> bool {
+    let Some(window) = resolve(id) else { return false };
+    id.pid().is_some()
+        || desktop().is_some_and(|d| d.conn.get_geometry(window).ok().and_then(|c| c.reply().ok()).is_some())
+}
+
 pub fn window_bounds(id: &SourceId) -> Option<(Rect, bool)> {
     let d = desktop()?;
     let window = resolve(id)?;
@@ -136,6 +145,22 @@ pub fn front_window() -> Option<FrontWindow> {
     let pid = info.pid?;
     let readable = info.on_screen() && matches!(info.kind, WindowKind::Normal | WindowKind::Dialog);
     Some(FrontWindow { window: readable.then(|| window_source_id(active, Some(pid))), pid })
+}
+
+/// The host process id of the client that created `window`, from the X server's own record of the
+/// client's socket (X-Resource), not the window's `_NET_WM_PID`, which a sandboxed (Flatpak) client
+/// sets to a pid of its own namespace. `None` without X-Resource or for a remote client.
+pub fn window_host_pid(window: Window) -> Option<u32> {
+    use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
+    let d = desktop()?;
+    let spec = ClientIdSpec { client: window, mask: ClientIdMask::LOCAL_CLIENT_PID };
+    let reply = d.conn.res_query_client_ids(&[spec]).ok()?.reply().ok()?;
+    reply
+        .ids
+        .iter()
+        .find(|id| u32::from(id.spec.mask) & u32::from(ClientIdMask::LOCAL_CLIENT_PID) != 0)
+        .and_then(|id| id.value.first().copied())
+        .filter(|pid| *pid > 0)
 }
 
 pub fn frontmost_pid() -> Option<u32> {

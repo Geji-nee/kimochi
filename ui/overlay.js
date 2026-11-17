@@ -16,7 +16,7 @@ import { audioUrl } from './game-dictionary.js'
 import { createController } from './controller.js'
 import { radialItemForHotkey, RADIAL_MENU_SETTING } from './radial-items.js'
 import { padButtons, startRegionPad } from './region-pad.js'
-import { buttonName } from './controller-input.js'
+import { buttonName, pageMenuKey } from './controller-input.js'
 import { createPopupFocus, YOMITAN_FOCUS } from './popup-focus.js'
 import { ReadingHold } from './reading-hold.js'
 import { installPointerDiagnostics, pointerTrace, pointerTracing } from './pointer-diagnostics.js'
@@ -665,6 +665,8 @@ const renderer = new TextOverlayRenderer(wordsContainer, {
   onLookupStart: () => {
     holdAutoScan()
     controller?.mouseUsed()
+    lookupStartedAt = performance.now()
+    beatGamePause()
   }
 })
 
@@ -951,6 +953,13 @@ setInterval(() => void checkThrottled(), 4000)
  */
 let controllerHold = false
 let readingHold = false
+/** Game pause (`beatGamePause`): when the last lookup started, and whether a hold was sent. */
+let lookupStartedAt = -Infinity
+const LOOKUP_GRACE_MS = 1200
+/** When the pop-up host last said its pop-up is up (`overlay-reading-popup-alive`). */
+let remotePopupAliveAt = -Infinity
+const REMOTE_POPUP_ALIVE_MS = 3000
+let gamePauseHeld = false
 let layerPointerExit = null
 let hyprlandPointer = false
 let layerPointerPolling = false
@@ -963,16 +972,21 @@ function syncScanHold() {
   if (controllerHold || readingHold) scanner.pause()
   else if (scanner.isPaused) scanner.resume()
 }
+/** Whether a dictionary pop-up for the overlay's text is up, in any of its hosts. */
+function readingPopupShown() {
+  return (
+    remoteReadingPopup ||
+    apiReadingPopup ||
+    Boolean(extensionPopupRect) ||
+    [...livePopups].some((popup) => popup.isVisibleSync?.())
+  )
+}
 function syncReadingHold(readWordRects = null) {
   if (layerPointerExit) {
     window.__linuxLayerPointerInside = !layerPointerExit.outside()
     if (layerPointerExit.outside()) renderer.clearPointer()
   }
-  const popup =
-    remoteReadingPopup ||
-    apiReadingPopup ||
-    Boolean(extensionPopupRect) ||
-    [...livePopups].some((popup) => popup.isVisibleSync?.())
+  const popup = readingPopupShown()
   const enabled = overlayTextOn() && !state.regionSelecting
   if (!enabled) reading.reset()
   const next = enabled && reading.update(renderer.mouse, readWordRects?.() ?? renderer.hitRects({ x: 0, y: 0 }), popup)
@@ -980,16 +994,50 @@ function syncReadingHold(readWordRects = null) {
   readingHold = next
   syncScanHold()
   log({ check: 'auto-scan-reading-hold', hold: next })
+  beatGamePause()
 }
 /** The Yomitan API's pop-up for a word opened or closed (`installApiLookup`). */
 function apiPopupVisible(visible) {
   apiReadingPopup = visible
   syncReadingHold()
 }
+/**
+ * "Pause the game while reading" (Settings → Overlay): what the overlay is busy with, beaten to
+ * native every 500 ms. The beat is the proof the overlay is alive: if this page stops, the holds
+ * lapse and the game runs again. A lookup holds from its start until its pop-up is gone (a lookup
+ * that finds nothing holds for a moment only).
+ */
+function gamePauseReasons() {
+  const reasons = []
+  const now = performance.now()
+  // The pop-up host's pop-up counts only while that window keeps saying so: a host that crashed or
+  // reloaded after "visible" must not hold the game paused.
+  const remoteAlive = remoteReadingPopup && now - remotePopupAliveAt < REMOTE_POPUP_ALIVE_MS
+  const localPopup =
+    apiReadingPopup || Boolean(extensionPopupRect) || [...livePopups].some((popup) => popup.isVisibleSync?.())
+  if (remoteAlive || localPopup || now - lookupStartedAt < LOOKUP_GRACE_MS) reasons.push('lookup')
+  if (controller && controller.mode !== 'idle') reasons.push('navigation')
+  if (state.regionSelecting) reasons.push('regionEditor')
+  return reasons
+}
+function beatGamePause() {
+  if (!setting('pauseGameWhileReading')) {
+    if (gamePauseHeld) void native.gamePauseBeat([])
+    gamePauseHeld = false
+    return
+  }
+  const reasons = gamePauseReasons()
+  if (reasons.length === 0 && !gamePauseHeld) return
+  gamePauseHeld = reasons.length > 0
+  void native.gamePauseBeat(reasons)
+}
+setInterval(beatGamePause, 500)
+
 function holdForController(hold) {
   if (hold === controllerHold) return
   controllerHold = hold
   syncScanHold()
+  beatGamePause()
   log({ check: 'auto-scan-controller-hold', hold, running: scanner.isRunning })
 }
 
@@ -5247,6 +5295,31 @@ for (const type of [
   )
 }
 
+// Windows: opening the controller menu brings this overlay to the front, and Windows does not
+// call Kimochi's low-level keyboard hook (platform/windows/mouseguard.rs) for keys typed into
+// Kimochi's own windows, so the menu's keys never became `controller-key` events and the menu
+// ignored the keyboard. They arrive here instead: hand them to the controller as the hook
+// would have, and keep them from the page, as the hook keeps them from the game. While a game
+// is in front the hook still takes them, and this page never sees them.
+// (`pageMenuKey`: never a field being typed in, nor while the region editor has the keys.)
+for (const type of ['keydown', 'keyup']) {
+  window.addEventListener(
+    type,
+    (event) => {
+      const payload = pageMenuKey(event, {
+        os: window.__KIMOCHI_PLATFORM__?.os,
+        mode: controller?.mode,
+        regionSelecting: state.regionSelecting
+      })
+      if (!payload) return
+      event.stopImmediatePropagation()
+      event.preventDefault()
+      controller.key(payload)
+    },
+    { capture: true }
+  )
+}
+
 window.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return
   // 10ten is dismissed with a synthetic Escape on this window (host/ext/content.js); if it
@@ -5506,8 +5579,12 @@ await native.listen('pointer', ({ payload }) => {
   noteScanFeed(payload, init !== null)
 })
 
+await native.listen('overlay-reading-popup-alive', () => {
+  remotePopupAliveAt = performance.now()
+})
 await native.listen('overlay-reading-popup', ({ payload }) => {
   remoteReadingPopup = payload?.visible === true
+  if (remoteReadingPopup) remotePopupAliveAt = performance.now()
   remoteReadingRects = remoteReadingPopup && Array.isArray(payload.rects) ? payload.rects : []
   syncReadingHold()
   void publishRegions()
