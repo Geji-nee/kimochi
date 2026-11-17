@@ -30,10 +30,13 @@ const {
   DEFAULT_OVERLAY_STYLE,
   effectiveControllerButtons,
   hexToRgbTriplet,
+  hookCardLocksAutoAlign,
   overlayStyleOf,
   highlightStrength,
+  resolveHookCardAppearance,
   resolveOverlayCardAppearance,
   sharedButtonActions,
+  usableInputSource,
   withDefaults
 } = await import(pathToFileURL(outfile).href)
 process.on('exit', () => {
@@ -131,21 +134,55 @@ test('controller buttons: new actions take their defaults, and the retired secon
 })
 
 test('overlay look: the default, the Rust store, and what a stored style reads as', async () => {
-  assert.deepEqual(SETTINGS_DEFAULTS.overlayStyle, { color: '#3e63dd', appearance: 'app', opacity: 40 })
+  assert.deepEqual(SETTINGS_DEFAULTS.overlayStyle, {
+    color: '#3e63dd',
+    appearance: 'app',
+    opacity: 40,
+    hookAppearance: 'app'
+  })
   assert.deepEqual(DEFAULT_OVERLAY_STYLE, SETTINGS_DEFAULTS.overlayStyle)
   const rust = await readFile(new URL('../src-tauri/src/settings.rs', import.meta.url), 'utf8')
+  // Without `hookAppearance`: the store deep-merges its default under what is stored, which would
+  // otherwise give a card that followed a stored `dark` the look `app`.
   assert.match(rust, /"overlayStyle": \{ "color": "#3e63dd", "appearance": "app", "opacity": 40 \}/)
   // A stored style is made whole, and anything this build cannot draw falls back to the default.
   assert.deepEqual(withDefaults('overlayStyle', undefined), DEFAULT_OVERLAY_STYLE)
   assert.deepEqual(withDefaults('overlayStyle', { color: '#0090FF' }), {
     color: '#0090ff',
     appearance: 'app',
-    opacity: 40
+    opacity: 40,
+    hookAppearance: 'app'
   })
   assert.deepEqual(overlayStyleOf({ color: 'blue', appearance: 'sepia' }), DEFAULT_OVERLAY_STYLE)
-  assert.deepEqual(overlayStyleOf({ appearance: 'light' }), { color: '#3e63dd', appearance: 'light', opacity: 40 })
+  assert.deepEqual(overlayStyleOf({ appearance: 'light' }), {
+    color: '#3e63dd',
+    appearance: 'light',
+    opacity: 40,
+    hookAppearance: 'light'
+  })
   assert.equal(overlayStyleOf({ opacity: 140 }).opacity, 100)
   assert.equal(overlayStyleOf({ opacity: '50' }).opacity, 40)
+  // The Text Hooker's card: a style stored before it had its own look keeps the look it had
+  // (the overlay's cards'), and from then on the two are apart.
+  assert.equal(overlayStyleOf({ appearance: 'blend', color: '#3e63dd', opacity: 40 }).hookAppearance, 'blend')
+  assert.equal(overlayStyleOf({ appearance: 'dark', hookAppearance: 'transparent' }).hookAppearance, 'transparent')
+  assert.equal(overlayStyleOf({ appearance: 'transparent', hookAppearance: 'light' }).appearance, 'transparent')
+  assert.equal(overlayStyleOf({ appearance: 'transparent', hookAppearance: 'light' }).hookAppearance, 'light')
+  // The overlay made transparent never hides the card by itself.
+  assert.equal(overlayStyleOf({ appearance: 'transparent' }).hookAppearance, 'app')
+  assert.equal(overlayStyleOf({ appearance: 'light', hookAppearance: 'sepia' }).hookAppearance, 'app')
+  assert.equal(resolveOverlayCardAppearance({ appearance: 'transparent' }, 'dark', false), 'transparent')
+  assert.equal(resolveHookCardAppearance({ appearance: 'transparent' }, 'light', true), 'light')
+  assert.equal(resolveHookCardAppearance({ appearance: 'dark', hookAppearance: 'app' }, 'system', true), 'dark')
+  assert.equal(
+    resolveHookCardAppearance({ appearance: 'dark', hookAppearance: 'transparent' }, 'light', false),
+    'transparent'
+  )
+  // A Transparent card is always auto-aligned; the overlay's own look has no say in it.
+  assert.equal(hookCardLocksAutoAlign({ appearance: 'dark', hookAppearance: 'transparent' }), true)
+  assert.equal(hookCardLocksAutoAlign({ appearance: 'transparent', hookAppearance: 'dark' }), false)
+  assert.equal(hookCardLocksAutoAlign({ appearance: 'transparent' }), false)
+  assert.equal(hookCardLocksAutoAlign(undefined), false)
   assert.equal(highlightStrength(40), 1)
   assert.equal(highlightStrength(100), 2.5)
   assert.equal(highlightStrength(0), 0)
@@ -165,4 +202,13 @@ test('overlay look: the cards follow Kimochi unless told otherwise', () => {
   assert.equal(resolveOverlayCardAppearance(app, 'system', false), 'light')
   assert.equal(resolveOverlayCardAppearance({ ...app, appearance: 'light' }, 'dark', true), 'light')
   assert.equal(resolveOverlayCardAppearance({ ...app, appearance: 'dark' }, 'light', false), 'dark')
+})
+
+test('a Text Hooker input from another system reads as OCR where games cannot be hooked', () => {
+  assert.equal(usableInputSource('hook', 'macos'), 'ocr')
+  assert.equal(usableInputSource('hook', 'windows'), 'hook')
+  assert.equal(usableInputSource('hook', 'linux'), 'hook')
+  // Unknown system: as stored.
+  assert.equal(usableInputSource('hook', undefined), 'hook')
+  assert.equal(usableInputSource('clipboard', 'macos'), 'clipboard')
 })

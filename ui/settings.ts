@@ -38,10 +38,27 @@ export type Appearance = (typeof APPEARANCES)[number]
 
 /**
  * How the overlay's text cards look (the card a hovered word turns into, and the grouped
- * overlay's regions): `app` takes Kimochi's own appearance, `light` and `dark` are fixed, and
- * `blend` takes the colours of the source behind each word or region.
+ * overlay's regions): `app` takes Kimochi's own appearance, `light` and `dark` are fixed,
+ * `blend` takes the colours of the source behind each word or region, and `transparent` draws
+ * nothing at all (no highlight, no card, no text, even with the lookup key held): the words are
+ * still there to point at, so only the dictionary pop-up ever shows.
  */
-export type OverlayCardAppearance = 'app' | 'light' | 'dark' | 'blend'
+export type OverlayCardAppearance = 'app' | 'light' | 'dark' | 'blend' | 'transparent'
+
+/** Every `OverlayCardAppearance`, in the order Settings and Gaming Mode offer them. */
+export const OVERLAY_CARD_APPEARANCES: readonly OverlayCardAppearance[] = [
+  'app',
+  'light',
+  'dark',
+  'blend',
+  'transparent'
+]
+
+/** An appearance as the overlay draws it: Kimochi's own resolved to light or dark. */
+export type ResolvedCardAppearance = Exclude<OverlayCardAppearance, 'app'>
+
+const isCardAppearance = (value: unknown): value is OverlayCardAppearance =>
+  (OVERLAY_CARD_APPEARANCES as readonly unknown[]).includes(value)
 
 /** Settings → Overlay → Overlay appearance (ui/overlay-text.css draws it). */
 export interface OverlayStyleSettings {
@@ -51,6 +68,15 @@ export interface OverlayStyleSettings {
   appearance: OverlayCardAppearance
   /** How opaque the highlight is, 0–100; see `highlightStrength`. */
   opacity: number
+  /**
+   * The Text Hooker's card over the game (ui/hook-card.css), on its own: Settings → Text Hooker →
+   * Card style, and Settings → Overlay → Text Hooker card. Before it existed the card followed
+   * `appearance`, so a stored style without it reads as that (`overlayStyleOf`) and nothing
+   * changes for anyone; it is written alongside the rest from then on, and the two are separate.
+   * Not in the Rust store's default (settings.rs), which is deep-merged under what is stored and
+   * would otherwise put `app` in its place.
+   */
+  hookAppearance: OverlayCardAppearance
 }
 
 /** The highlight colours Settings offers; any `#rrggbb` is accepted. The first is the default. */
@@ -68,7 +94,8 @@ export const OVERLAY_HIGHLIGHT_PRESETS: readonly { value: string; label: string 
 export const DEFAULT_OVERLAY_STYLE: OverlayStyleSettings = {
   color: OVERLAY_HIGHLIGHT_PRESETS[0].value,
   appearance: 'app',
-  opacity: 40
+  opacity: 40,
+  hookAppearance: 'app'
 }
 
 /**
@@ -93,15 +120,18 @@ export function overlayStyleOf(stored: unknown): OverlayStyleSettings {
     stored && typeof stored === 'object' && !Array.isArray(stored) ? (stored as Partial<OverlayStyleSettings>) : {}
   const color =
     typeof raw.color === 'string' && HEX_COLOR.test(raw.color) ? raw.color.toLowerCase() : DEFAULT_OVERLAY_STYLE.color
-  const appearance =
-    raw.appearance === 'light' || raw.appearance === 'dark' || raw.appearance === 'app' || raw.appearance === 'blend'
-      ? raw.appearance
-      : DEFAULT_OVERLAY_STYLE.appearance
+  const appearance = isCardAppearance(raw.appearance) ? raw.appearance : DEFAULT_OVERLAY_STYLE.appearance
   const opacity =
     typeof raw.opacity === 'number' && Number.isFinite(raw.opacity)
       ? Math.min(100, Math.max(0, Math.round(raw.opacity)))
       : DEFAULT_OVERLAY_STYLE.opacity
-  return { color, appearance, opacity }
+  // Not stored yet: the card looks as it did when it followed the overlay's cards.
+  const hookAppearance = isCardAppearance(raw.hookAppearance)
+    ? raw.hookAppearance
+    : raw.hookAppearance === undefined && appearance !== 'transparent'
+      ? appearance
+      : DEFAULT_OVERLAY_STYLE.hookAppearance
+  return { color, appearance, opacity, hookAppearance }
 }
 
 /**
@@ -109,13 +139,31 @@ export function overlayStyleOf(stored: unknown): OverlayStyleSettings {
  * the OS's, which the caller reads as `systemDark`).
  */
 export function resolveOverlayCardAppearance(
-  style: OverlayStyleSettings,
+  style: Pick<OverlayStyleSettings, 'appearance'>,
   appearance: Appearance,
   systemDark: boolean
-): 'light' | 'dark' | 'blend' {
-  if (style.appearance !== 'app') return style.appearance
+): ResolvedCardAppearance {
+  if (style.appearance !== 'app' && isCardAppearance(style.appearance)) return style.appearance
   if (appearance === 'light' || appearance === 'dark') return appearance
   return systemDark ? 'dark' : 'light'
+}
+
+/**
+ * Whether the Text Hooker's card is drawn Transparent, which keeps Auto align on whatever its
+ * setting: nothing of the card shows, so only Auto align can put its text over the game's, where
+ * the reader points to look a word up (and the hidden card has no bar or corner to place it by).
+ */
+export function hookCardLocksAutoAlign(style: unknown): boolean {
+  return overlayStyleOf(style).hookAppearance === 'transparent'
+}
+
+/** The same for the Text Hooker's card, from its own setting (`hookAppearance`). */
+export function resolveHookCardAppearance(
+  style: unknown,
+  appearance: Appearance,
+  systemDark: boolean
+): ResolvedCardAppearance {
+  return resolveOverlayCardAppearance({ appearance: overlayStyleOf(style).hookAppearance }, appearance, systemDark)
 }
 /** Interface scale: type, spacing and controls move together. Transcript text has its own size. */
 /**
@@ -989,4 +1037,18 @@ export type OverlayTextChange = 'idle' | 'scan' | 'scan-pending'
 export function overlayTextChange(was: boolean | null, shown: boolean, busy: boolean): OverlayTextChange {
   if (was !== false || !shown) return 'idle'
   return busy ? 'scan-pending' : 'scan'
+}
+
+/** Whether this system can hook a game's text: Windows, and Linux (games under Proton or Wine). */
+export function textHookingSupported(os: string | undefined): boolean {
+  return os === 'windows' || os === 'linux'
+}
+
+/**
+ * The Log's input as this system can use it. Settings are an account's, so a Text Hooker input
+ * chosen on a Windows PC reaches a Mac too; there it reads as OCR, while the stored choice stays
+ * for the systems that can hook. An unknown system takes the stored one.
+ */
+export function usableInputSource<T extends string>(stored: T, os: string | undefined): T | 'ocr' {
+  return stored === 'hook' && os !== undefined && !textHookingSupported(os) ? 'ocr' : stored
 }

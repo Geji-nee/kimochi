@@ -96,8 +96,12 @@ import {
   isOverlayTextVisible,
   nextOverlayToggle,
   overlayTextChange,
+  hookCardLocksAutoAlign,
+  overlayStyleOf,
+  resolveHookCardAppearance,
   resolveHostEngine,
-  resolveOverlayCardAppearance
+  resolveOverlayCardAppearance,
+  usableInputSource
 } from './settings.js'
 import { clearOfGame, exceptRects, popupHitRects } from './regions.js'
 import { Generation, PipelineLock } from './pipeline.js'
@@ -364,16 +368,25 @@ const hookExample = () => {
   if (isJapanese(language)) return HOOK_EXAMPLE
   return sampleFor(language)?.sentence ?? 'The game’s text appears here.'
 }
-const hookMode = () => (setting('superTexthooker')?.inputSource ?? 'ocr') === 'hook'
+/** The Log's input, as this system can use it (a Text Hooker input synced from Windows is OCR here). */
+const inputNow = () =>
+  usableInputSource(setting('superTexthooker')?.inputSource ?? 'ocr', window.__KIMOCHI_PLATFORM__?.os)
+const hookMode = () => inputNow() === 'hook'
 /**
  * The browser extension is the source (src-tauri/src/browser_bridge.rs): its pictures are read
  * here (`onBrowserScan`) but drawn by the extension over the page, never by this window.
  */
-const browserMode = () => (setting('superTexthooker')?.inputSource ?? 'ocr') === 'browser'
+const browserMode = () => inputNow() === 'browser'
 const hookKey = () => hook.exe?.toLowerCase() ?? null
 const hookGame = () => (hookKey() && setting('textHookerGames')?.[hookKey()]) || {}
-/** The game's settings, with the defaults (Settings → Text Hooker) where it has none (hook-games.ts). */
-const hookSet = () => hookSettings(setting('textHookerDefaults'), hookGame())
+/**
+ * The game's settings, with the defaults (Settings → Text Hooker) where it has none (hook-games.ts).
+ * A card drawn Transparent is always auto-aligned (`hookCardLocksAutoAlign`).
+ */
+const hookSet = () => {
+  const set = hookSettings(setting('textHookerDefaults'), hookGame())
+  return hookCardLocksAutoAlign(setting('overlayStyle')) ? { ...set, autoAlign: true } : set
+}
 const hookAutoAlign = () => hookSet().autoAlign
 /** The card over the game at all (Settings → Text Hooker → Show the card; the game menu's Card). */
 const hookCardOn = () => hookCardShow(setting('textHookerShowCard')) !== 'never'
@@ -447,7 +460,22 @@ async function syncGamingHints() {
   syncHints()
 }
 
-/** Show the hint bar while there is text to point at and nothing else is using the overlay. */
+/**
+ * Whether the overlay's words and the Text Hooker's card are drawn at all. Words show their
+ * highlight unless its opacity is Off, and their hover card unless it is Transparent (Settings →
+ * Overlay appearance); with both gone they are there to point at, unseen. The Text Hooker's card
+ * is unseen when Transparent (Text Hooker → Card style).
+ */
+const wordsSeen = () => {
+  const style = overlayStyleOf(setting('overlayStyle'))
+  return style.appearance !== 'transparent' || style.opacity > 0
+}
+const hookCardSeen = () => overlayStyleOf(setting('overlayStyle')).hookAppearance !== 'transparent'
+
+/**
+ * Show the hint bar while there is text to point at and nothing else is using the overlay. Text
+ * drawn transparent does not count: nothing but the dictionary pop-up shows over the game then.
+ */
 function syncHints(readWordRects = null) {
   const shown =
     shiftGated &&
@@ -456,7 +484,8 @@ function syncHints(readWordRects = null) {
     !state.dictionaryOpen &&
     (controller?.mode ?? 'idle') === 'idle' &&
     Boolean(state.origin) &&
-    ((readWordRects?.() ?? renderer.hitRects(state.origin)).length > 0 || (hook.card?.rects().length ?? 0) > 0)
+    ((wordsSeen() && (readWordRects?.() ?? renderer.hitRects(state.origin)).length > 0) ||
+      (hookCardSeen() && (hook.card?.rects().length ?? 0) > 0))
   hints.sync(shown, clickThrough(), native.getSetting('overlayLookupKey') ?? 'shift', hoverLookup())
   if (shown) hints.place(hintArea())
 }
@@ -610,8 +639,7 @@ function reportOutcome(post, { auto = false } = {}) {
  * sidebar shows Quick Shot only while the input is OCR, so the scan shortcut follows the same
  * rule rather than drawing a region under a Clipboard or WebSocket source.
  */
-const isQuickShot = () =>
-  Boolean(setting('quickShotEnabled')) && (setting('superTexthooker')?.inputSource ?? 'ocr') === 'ocr'
+const isQuickShot = () => Boolean(setting('quickShotEnabled')) && inputNow() === 'ocr'
 
 // ---------------------------------------------------------------------------
 // 1. Rendering
@@ -766,7 +794,7 @@ controller = createController({
         autoAlign: set.autoAlign,
         opacity: set.opacity,
         fontPx,
-        look: setting('overlayStyle')?.appearance ?? 'app',
+        look: overlayStyleOf(setting('overlayStyle')).hookAppearance,
         box: hook.card?.box() ?? null
       }
     },
@@ -777,13 +805,19 @@ controller = createController({
     // Back on, as in Settings: straight back to where it last found the game's text, the size
     // measured again (a size set by hand goes), and the screen read at once (`realignHookCard`).
     setAutoAlign: (on) =>
-      on ? saveHookGame({ autoAlign: true }, ['text', 'leading']) : saveHookGame({ autoAlign: false }),
+      on
+        ? saveHookGame({ autoAlign: true }, ['text', 'leading'])
+        : hookCardLocksAutoAlign(setting('overlayStyle'))
+          ? undefined
+          : saveHookGame({ autoAlign: false }),
     textSize: (step) => {
       const box = hook.card?.box()
       return box ? onHookCardTextSize(step, box) : undefined
     },
     setOpacity: (opacity) => saveHookGame({ opacity }),
-    setLook: (appearance) => native.setSetting('overlayStyle', { ...(setting('overlayStyle') ?? {}), appearance }),
+    // The card's own look (Settings → Text Hooker → Card style), apart from the overlay's cards.
+    setLook: (hookAppearance) =>
+      native.setSetting('overlayStyle', { ...overlayStyleOf(setting('overlayStyle')), hookAppearance }),
     steer: (box) => hook.card?.steer(box) ?? null,
     release: (commit) => {
       hook.card?.release(commit)
@@ -1554,10 +1588,11 @@ function hookCardView() {
       height
     }
   }
-  // Blend takes the colours of what the game's text sits on, so only while the card is over the
-  // game and a reading said what that is; otherwise the app's own light or dark.
-  const style = setting('overlayStyle') ?? {}
-  let theme = resolveOverlayCardAppearance(style, setting('appearance'), systemDark.matches)
+  // The card's own look (`hookAppearance`). Blend takes the colours of what the game's text sits
+  // on, so only while the card is over the game and a reading said what that is; otherwise the
+  // app's own light or dark. Transparent draws nothing of the card: its text is still there to
+  // look up.
+  let theme = resolveHookCardAppearance(setting('overlayStyle'), setting('appearance'), systemDark.matches)
   const inside =
     where.x >= ox &&
     where.y >= oy &&
@@ -1565,7 +1600,7 @@ function hookCardView() {
     where.y + where.height <= oy + bounds.height
   const surface = theme === 'blend' && inside ? (game.surface ?? null) : null
   if (theme === 'blend' && !surface)
-    theme = resolveOverlayCardAppearance({ ...style, appearance: 'app' }, setting('appearance'), systemDark.matches)
+    theme = resolveOverlayCardAppearance({ appearance: 'app' }, setting('appearance'), systemDark.matches)
   if (gameRows) lines = gameRows.length
   return {
     text: gameRows && !example ? gameRows.join('\n') : shownText,
@@ -4963,8 +4998,8 @@ await mirrorDictionaryEngine({ repair: true })
 
 /**
  * The text's look (Settings → Overlay → Overlay appearance): the highlight colour, and whether
- * the cards are light or dark, which with "Same as Kimochi" follows the app's appearance and,
- * for `system`, the OS.
+ * the cards are light, dark, blended or transparent (no card, the highlight alone); "Same as Kimochi" follows
+ * the app's appearance and, for `system`, the OS.
  */
 const systemDark = matchMedia('(prefers-color-scheme: dark)')
 function applyOverlayStyle() {
@@ -5007,7 +5042,11 @@ await native.watchSettings((key) => {
   }
   // Mirror only: a switch is reloaded by Settings (`dictionary_engine_apply`), not from here.
   if (key === 'yomitanSettings') void mirrorDictionaryEngine()
-  if (key === 'overlayStyle' || key === 'appearance') applyOverlayStyle()
+  if (key === 'overlayStyle' || key === 'appearance') {
+    applyOverlayStyle()
+    // The hint bar shows only while something is drawn (the card follows in `draw`, below).
+    syncHints()
+  }
   syncOverlayText()
 })
 

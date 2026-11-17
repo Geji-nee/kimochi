@@ -1,43 +1,36 @@
 /**
  * Settings → Overlay → Overlay appearance: one large live preview, then three controls side by side
  * (one under another in a narrow window): the colour of the highlight over hoverable text, how
- * opaque it is (a slider), and (a dropdown) whether the card a hovered word turns into (and the grouped overlay's regions)
- * is light, dark, blended or the same as Kimochi. The preview is drawn with the overlay's own
- * elements and stylesheet (ui/overlay-text.css) and follows every control as it moves, so what is
- * shown is what is drawn; pointing at a word in it turns that word into its card.
+ * opaque it is (a slider with its scale; Off hides it), and (a dropdown) the hover card's
+ * appearance, the card a hovered word (or the grouped overlay's region) turns into: light, dark,
+ * blended, the same as Kimochi, or transparent, no card at all, only the dictionary pop-up (the
+ * highlight is separate and stays). The preview is drawn with the overlay's own elements and
+ * stylesheet (ui/overlay-text.css) and follows every control as it moves, so what is shown is what
+ * is drawn; pointing at a word in it turns that word into its card.
  *
  * The stored setting is `overlayStyle` (ui/settings.ts `OverlayStyleSettings`); the overlay reads
  * it live (overlay.js `applyOverlayStyle`).
  */
 import { useEffect, useId, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import * as ToggleGroup from '@radix-ui/react-toggle-group'
-import { Blend, Check, Monitor, Moon, Pipette, Sun } from 'lucide-react'
-import { Select, Slider, cn } from '@kit'
+import { Check, Pipette } from 'lucide-react'
+import { Slider, cn } from '@kit'
 import {
   DEFAULT_OVERLAY_STYLE,
   OVERLAY_HIGHLIGHT_PRESETS,
   hexToRgbTriplet,
   highlightStrength,
   overlayStyleOf,
-  type OverlayCardAppearance,
-  type OverlayStyleSettings
+  type OverlayStyleSettings,
+  type ResolvedCardAppearance
 } from '@ui/settings'
 import { useSetting } from '../../bridge/useSetting'
 import { usePrefs } from '../../kit/appearance-state'
 import { PREVIEW_SURFACE, previewWord, usePreviewLine, type PreviewLine } from './overlayPreview'
+import { CardLookSelect, TransparentMark } from './CardLook'
+import { GridField } from '../../components/GridField'
 import '@ui/overlay-text.css'
 import './overlay-look.css'
-
-const CARD_CHOICES: readonly {
-  value: OverlayCardAppearance
-  label: string
-  icon: ReactNode
-}[] = [
-  { value: 'app', label: 'Same as Kimochi', icon: <Monitor /> },
-  { value: 'light', label: 'Light', icon: <Sun /> },
-  { value: 'dark', label: 'Dark', icon: <Moon /> },
-  { value: 'blend', label: 'Blend', icon: <Blend /> }
-]
 
 /**
  * One preview: the overlay's word boxes over a line of game text, as render.js and
@@ -53,7 +46,7 @@ function Preview({
   lit = line.lit,
   onPoint
 }: {
-  theme: 'light' | 'dark' | 'blend'
+  theme: ResolvedCardAppearance
   colorRgb: string
   strength: number
   line: PreviewLine
@@ -69,6 +62,7 @@ function Preview({
       style={{ '--ocr-hl-rgb': colorRgb, '--ocr-hl-strength': strength } as CSSProperties}
       aria-hidden
     >
+      <GridField />
       <span
         className="overlay-look-scene"
         lang={line.lang}
@@ -96,6 +90,12 @@ function Preview({
           </span>
         ))}
       </span>
+      {theme === 'transparent' && (
+        <TransparentMark>
+          {/* With the highlight Off as well, nothing at all is drawn over the game. */}
+          {strength > 0 ? 'No hover card: only the highlight shows' : 'No hover card or highlight'}
+        </TransparentMark>
+      )}
     </span>
   )
 }
@@ -144,18 +144,12 @@ export function OverlayLook(): ReactNode {
   }
 
   const cardTheme = look.appearance === 'app' ? resolved : look.appearance
+  const lit = pointed ?? line.lit
 
   return (
     <div className="overlay-look">
       <div className="overlay-look-stage">
-        <Preview
-          theme={cardTheme}
-          colorRgb={colorRgb}
-          strength={strength}
-          line={line}
-          lit={pointed ?? line.lit}
-          onPoint={setPointed}
-        />
+        <Preview theme={cardTheme} colorRgb={colorRgb} strength={strength} line={line} lit={lit} onPoint={setPointed} />
       </div>
       <div className="overlay-look-controls">
         <div className="overlay-look-control">
@@ -204,35 +198,67 @@ export function OverlayLook(): ReactNode {
           <div className="overlay-look-opacity-control">
             <Slider
               aria-label="Highlight opacity"
-              valueText={(value) => `${value}%`}
+              valueText={(value) => (value === 0 ? 'Off' : `${value}%`)}
               value={[opacity]}
               onValueChange={(values) => setOpacityDraft(values[0])}
               min={0}
               max={100}
               step={5}
             />
+            <OpacityScale value={opacity} onChoose={setOpacityDraft} />
           </div>
         </div>
         <div className="overlay-look-control">
-          <span className="overlay-look-label">Cards</span>
-          <Select
-            aria-label="Cards"
-            className="overlay-look-card-select"
+          <span className="overlay-look-label">Hover card appearance</span>
+          <CardLookSelect
+            label="Hover card appearance"
             value={look.appearance}
-            onValueChange={(value) => {
-              if (value !== look.appearance) void setStored({ ...look, appearance: value })
-            }}
-            options={CARD_CHOICES.map((choice) => ({
-              value: choice.value,
-              label: (
-                <span className="overlay-look-card-option">
-                  {choice.icon}
-                  {choice.label}
-                </span>
-              )
-            }))}
+            onChange={(appearance) => void setStored({ ...look, appearance })}
           />
         </div>
+      </div>
+    </div>
+  )
+}
+
+/** Steps of the scale under the opacity slider: a tick each 5%, a number each 25%. */
+const SCALE_TICKS = Array.from({ length: 21 }, (_, index) => index * 5)
+
+/**
+ * Under the opacity slider: its scale, a tick each step and a number each quarter (0 is Off). The
+ * numbers are buttons that set it there, as a step slider's names are.
+ */
+function OpacityScale({ value, onChoose }: { value: number; onChoose: (value: number) => void }): ReactNode {
+  // Radix keeps the thumb inside the track, so its centre runs from half a thumb in at each end
+  // (the thumb is 0.875rem, .k-slider-thumb).
+  const at = (step: number): string => `calc(0.4375rem + (100% - 0.875rem) * ${step / 100})`
+  return (
+    <div className="overlay-look-scale">
+      <div className="overlay-look-ticks" aria-hidden>
+        {SCALE_TICKS.map((step) => (
+          <span
+            key={step}
+            className="overlay-look-tick"
+            data-major={step % 25 === 0 || undefined}
+            data-passed={step <= value || undefined}
+            style={{ left: at(step) }}
+          />
+        ))}
+      </div>
+      <div className="overlay-look-numbers">
+        {SCALE_TICKS.filter((step) => step % 25 === 0).map((step) => (
+          <button
+            key={step}
+            type="button"
+            tabIndex={-1}
+            className="overlay-look-number"
+            data-selected={step === value || undefined}
+            style={{ left: at(step) }}
+            onClick={() => onChoose(step)}
+          >
+            {step === 0 ? 'Off' : step}
+          </button>
+        ))}
       </div>
     </div>
   )
