@@ -34,6 +34,7 @@ const {
   hookCardLocksAutoAlign,
   overlayStyleOf,
   highlightStrength,
+  popupOpacityOf,
   resolveHookCardAppearance,
   resolveOverlayCardAppearance,
   sharedButtonActions,
@@ -196,6 +197,18 @@ test('overlay look: the default, the Rust store, and what a stored style reads a
   assert.equal(hexToRgbTriplet('#3e63dd'), '62, 99, 221')
   assert.equal(hexToRgbTriplet('#fff'), null)
   assert.equal(hexToRgbTriplet(12), null)
+})
+
+test('dictionary pop-up opacity: 100 (solid) unless changed, in the Rust store too', async () => {
+  assert.equal(SETTINGS_DEFAULTS.dictionaryPopupOpacity, 100)
+  const rust = await readFile(new URL('../src-tauri/src/settings.rs', import.meta.url), 'utf8')
+  assert.match(rust, /"dictionaryPopupOpacity": 100,/)
+  assert.equal(withDefaults('dictionaryPopupOpacity', undefined), 100)
+  assert.equal(withDefaults('dictionaryPopupOpacity', 42.4), 42)
+  assert.equal(popupOpacityOf(-5), 10, 'never fainter than 10%')
+  assert.equal(popupOpacityOf(250), 100)
+  assert.equal(popupOpacityOf('50'), 100)
+  assert.equal(popupOpacityOf(Number.NaN), 100)
 })
 
 test('overlay look: the cards follow Kimochi unless told otherwise', () => {

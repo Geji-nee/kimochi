@@ -131,7 +131,8 @@ function LookupKeyRow(): ReactNode {
  * Look up on hover (`overlayHoverLookup`): resting the pointer on a word on the overlay looks it
  * up with no key held. Lookups only: the words keep letting clicks through to the game unless the
  * lookup key is held, so nothing here takes the mouse from it. Native decides when the pointer
- * rests rather than passes by (`state::HoverIntent`). Not on Wayland, where the pointer is read
+ * rests rather than passes by (`state::HoverIntent`); the pop-up closes once the pointer leaves
+ * the line, the pop-up and the gap between them (ui/overlay.js `checkPopupLeave`). Not on Wayland, where the pointer is read
  * only while the key is held, nor in Gaming Mode.
  */
 function HoverLookupRow(): ReactNode {
@@ -144,7 +145,7 @@ function HoverLookupRow(): ReactNode {
     <SettingsRow
       label="Look up on hover"
       controlId="overlay-hover-lookup"
-      description="Rest the pointer on a word on the overlay to look it up, no key needed."
+      description="Rest the pointer on a word on the overlay to look it up, no key needed. The pop-up closes once the pointer leaves the line and the pop-up."
     >
       <Switch id="overlay-hover-lookup" checked={hover} onCheckedChange={(checked) => void setHover(checked)} />
     </SettingsRow>

@@ -257,16 +257,14 @@ export function installApp(win, { engine, descriptor }) {
     await contentLink.registered
   }
 
-  /** 10ten's pop-up size (Settings → Dictionary, `tentenPopupSize`), now and as it changes. */
-  function followPopupSize() {
-    const apply = (value) => driver?.size(tentenPopupSize(value))
-    apply(undefined)
-    void Promise.resolve(invoke('settings_get', { key: 'tentenPopupSize' }))
+  /** Hand `apply` the setting `key`, now and as it changes. */
+  function followSetting(key, apply) {
+    void Promise.resolve(invoke('settings_get', { key }))
       .then(apply)
       .catch(() => {})
     void tauri?.event
       ?.listen('settings:changed', ({ payload }) => {
-        if (payload?.key === 'tentenPopupSize') apply(payload.value)
+        if (payload?.key === key) apply(payload.value)
       })
       .catch(() => {})
   }
@@ -290,7 +288,12 @@ export function installApp(win, { engine, descriptor }) {
       report,
       backgroundSender: () => ({ id: context.runtimeId, url: `${origin}/${descriptor.background.script}`, origin })
     })
-    if (descriptor.id === 'tenten') followPopupSize()
+    // 10ten's pop-up size (Settings → Dictionary), and every engine's opacity (Settings → Overlay).
+    if (descriptor.id === 'tenten') {
+      driver.size(tentenPopupSize(undefined))
+      followSetting('tentenPopupSize', (value) => driver?.size(tentenPopupSize(value)))
+    }
+    followSetting('dictionaryPopupOpacity', (value) => driver?.opacity(value))
     if (win.document.readyState === 'loading') {
       await new Promise((resolve) => win.document.addEventListener('DOMContentLoaded', resolve, { once: true }))
     }
@@ -433,6 +436,35 @@ export function installApp(win, { engine, descriptor }) {
       }
     : null
   api.status = () => (hub ? hub.status() : { ...relay?.status, hub: relay?.status.hub ?? null })
+  /**
+   * 10ten looks up on bare hover in this window while `on` (the overlay's Look up on hover), as it
+   * does by default in a browser: every pointer move looks up, so the pop-up glides from word to
+   * word. Kimochi sets its "Show popup" key to Shift (engines.js `tenten-hold-shift`), and with a
+   * key set 10ten closes a pop-up the key opened on the next move without it, so a key added to
+   * a resting pointer never glides. Its stored settings stay as they are, so the Log and the
+   * reader's other windows keep waiting for the key: only the config its background sends this
+   * window (`enable`) is read without hold-to-show keys, and sent again when `on` changes.
+   */
+  let bareHoverOn = false
+  let lastEnable = null
+  const withBareHover = (message) =>
+    bareHoverOn && message?.config && typeof message.config === 'object'
+      ? { ...message, config: { ...message.config, holdToShowKeys: [] } }
+      : message
+  if (context && descriptor.id === 'tenten') {
+    context.setInbound((message) => {
+      if (message?.type !== 'enable') return message
+      lastEnable = message
+      return withBareHover(message)
+    })
+  }
+  api.bareHover = (on) => {
+    if (!context || descriptor.id !== 'tenten' || Boolean(on) === bareHoverOn) return
+    bareHoverOn = Boolean(on)
+    report({ check: 'tenten-bare-hover', on: bareHoverOn })
+    const sender = { id: context.runtimeId, url: `${origin}/${descriptor.background.script}`, origin }
+    if (lastEnable) void context.deliverLocal(withBareHover(lastEnable), sender)
+  }
 
   win.__kimochiExtensionHost = api
   return api

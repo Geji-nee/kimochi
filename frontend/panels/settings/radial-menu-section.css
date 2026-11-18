@@ -238,3 +238,16 @@
 .radial-preview[data-dragging] .cm-shortcut {
   opacity: 0;
 }
+
+/* Base colour, accent colour, base opacity (RadialStyle.tsx): the two colour columns as wide as
+   their swatches, so their rows line up; the opacity takes the rest. */
+@container (min-width: 30rem) {
+  .overlay-look-controls.radial-style-controls {
+    grid-template-columns: auto auto minmax(0, 1fr);
+  }
+}
+
+/* The look's three boxes under the well: no inset between, so their dividers meet it. */
+.radial-preview-well:has(+ .overlay-look) .radial-preview {
+  margin-bottom: 0;
+}

@@ -1,5 +1,5 @@
 /**
- * Settings → Shortcuts & Controls → Radial menu: which actions the radial menu holds and in what
+ * Settings → Shortcuts & Controls → Radial menu, and the same in Settings → Overlay: which actions the radial menu holds and in what
  * order (`controllerMenuItems`, ui/radial-items.js), and a shortcut for each that runs it without
  * the menu (`hotkeys.menu…`: keys and a controller button or combination).
  *
@@ -13,7 +13,17 @@
  * panel. The menu always keeps one item, and Reset to default puts the shipped menu back (the
  * shortcuts stay as they are).
  */
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type PointerEvent, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent,
+  type ReactNode
+} from 'react'
 import { Eye, Plus, Trash2, X } from 'lucide-react'
 import { Badge, Button, IconButton, Menu, MenuContent, MenuItem, MenuTrigger, Select, SettingsSection } from '@kit'
 import { ICONS, ORBIT, RadialMenu } from '@ui/radial-menu.js'
@@ -25,28 +35,22 @@ import {
   effectiveRadialMenu,
   hotkeyConflicts,
   isDefaultRadialMenu,
-  radialItemsFor,
   removeRadialItem,
   reorderShownItems
 } from '@ui/radial-items.js'
-import { DEFAULT_OVERLAY_STYLE, hexToRgbTriplet, overlayStyleOf, type OverlayStyleSettings } from '@ui/settings'
+import { hexToRgbTriplet, radialBaseVars, type RadialMenuBase } from '@ui/settings'
+import { useRadialStyle } from './RadialStyle'
+import { shownRadialItems, useRadialShortcuts, type PreviewSource, type RadialItem } from './radialMenuPreview'
 import { useSetting } from '../../bridge/useSetting'
 import { useHotkeys } from '../../bridge/useHotkeys'
-import { useCapabilities } from '../../bridge/capabilities'
-import { getButtonName } from '../../bridge/useGamepad'
-import { usePadLayout } from '../../bridge/usePadLayout'
 import { usePrefs } from '../../kit/appearance-state'
 import { GamepadButtonCapture } from '../../components/GamepadButtonCapture'
 import { gamepadChord } from '../../vendor/shared-defaults'
-import { formatAccelerator, keyPlatformOf } from './accelerator'
 import { ShortcutRecorder } from './ShortcutRecorder'
 import { GridField } from '../../components/GridField'
 import '@ui/controller.css'
 import '@ui/controller-variants.css'
 import './radial-menu-section.css'
-
-type RadialItem = (typeof RADIAL_ITEMS)[number]
-type PreviewSource = 'ocr' | 'hooker'
 
 /** The stage the ring is drawn on, in the overlay's pixels; scaled down to fit the well. */
 const STAGE = 620
@@ -133,7 +137,9 @@ function RadialPreview({
   items,
   selected,
   details,
-  source,
+  color,
+  base,
+  source = 'ocr',
   onSource,
   onPick,
   onSelect,
@@ -145,17 +151,21 @@ function RadialPreview({
   items: { item: RadialItem; label: string; enabled: boolean }[]
   selected: string | null
   details: Record<string, string | undefined>
-  source: PreviewSource
-  onSource: (source: PreviewSource) => void
-  onPick: (id: string) => void
-  onSelect: (id: string) => void
-  onReorder: (ids: string[]) => void
+  /** The ring's colour, `#rrggbb` (`radialMenuColorOf`). */
+  color: string
+  /** The ring's base colour and opacity (`radialMenuBase`). */
+  base: RadialMenuBase
+  source?: PreviewSource
+  onSource?: (source: PreviewSource) => void
+  onPick?: (id: string) => void
+  onSelect?: (id: string) => void
+  onReorder?: (ids: string[]) => void
   /** The open item's panel, beside the ring; the ring moves over for it. */
-  panel: ReactNode
+  panel?: ReactNode
   /** Add item, at the bottom right. */
-  add: ReactNode
+  add?: ReactNode
   /** Reset to default, at the top right. */
-  reset: ReactNode
+  reset?: ReactNode
 }): ReactNode {
   const previewRef = useRef<HTMLDivElement>(null)
   const hostRef = useRef<HTMLDivElement>(null)
@@ -168,9 +178,8 @@ function RadialPreview({
     pickRef.current = onPick
   }, [onPick])
   const { resolved } = usePrefs()
-  // In the overlay's highlight colour, as the overlay draws it.
-  const [overlayStyle] = useSetting<OverlayStyleSettings>('overlayStyle', DEFAULT_OVERLAY_STYLE)
-  const ringRgb = hexToRgbTriplet(overlayStyleOf(overlayStyle).color) ?? undefined
+  const ringRgb = hexToRgbTriplet(color) ?? undefined
+  const baseVars = radialBaseVars(base)
   const selectedIndex = items.findIndex(({ item }) => item.id === selected)
 
   useEffect(() => {
@@ -178,7 +187,7 @@ function RadialPreview({
     if (!host) return
     const menu = new RadialMenu(host, {
       onChoose: (id: string) => {
-        if (performance.now() - draggedAt.current > 300) pickRef.current(id)
+        if (performance.now() - draggedAt.current > 300) pickRef.current?.(id)
       },
       onClose: () => undefined
     })
@@ -283,8 +292,8 @@ function RadialPreview({
     // Redrawn only now: picking its row while it moved would redraw the ring under the pointer.
     setTimeout(() => {
       previewRef.current?.removeAttribute('data-dragging')
-      onReorder(ids)
-      onSelect(id)
+      onReorder?.(ids)
+      onSelect?.(id)
     }, SNAP_MS)
   }
 
@@ -304,7 +313,16 @@ function RadialPreview({
           className="radial-preview-stage"
           data-cm-variant="halo"
           data-cm-theme={resolved}
-          style={{ width: STAGE, height: STAGE, ['--cm-ring-rgb' as string]: ringRgb }}
+          data-cm-ring-tone={baseVars.tone}
+          style={
+            {
+              width: STAGE,
+              height: STAGE,
+              '--cm-ring-rgb': ringRgb,
+              '--cm-base-rgb': baseVars.rgb,
+              '--cm-base-alpha': baseVars.alpha
+            } as CSSProperties
+          }
           aria-hidden
           onPointerDown={onPointerDown}
           onPointerMove={onPointerMove}
@@ -317,7 +335,7 @@ function RadialPreview({
             size="sm"
             variant="ghost"
             value={source}
-            onValueChange={onSource}
+            onValueChange={(value) => onSource?.(value)}
             options={SOURCES}
           />
         </div>
@@ -333,12 +351,10 @@ function RadialPreview({
 export function RadialMenuSection(): ReactNode {
   const [stored, setStored] = useSetting<string[] | null>(RADIAL_MENU_SETTING, null)
   const [hotkeys, setHotkeys] = useHotkeys()
-  const capabilities = useCapabilities()
-  const keyPlatform = keyPlatformOf(capabilities)
-  const padLayout = usePadLayout()
   const menu = useMemo(() => effectiveRadialMenu(stored), [stored])
   const [selected, setSelected] = useState<string | null>(null)
   const [source, setSource] = useState<PreviewSource>('ocr')
+  const { accent: color, base, controls } = useRadialStyle()
 
   const inMenu = useMemo(
     () => menu.map((id) => RADIAL_ITEMS.find((item) => item.id === id)).filter((item) => item !== undefined),
@@ -347,16 +363,7 @@ export function RadialMenuSection(): ReactNode {
   const outside = RADIAL_ITEMS.filter((item) => !menu.includes(item.id))
 
   /** What the ring shows with the chosen source, labelled as the overlay labels it. */
-  const shown = useMemo(
-    () =>
-      radialItemsFor(menu, source === 'hooker').flatMap(({ id, inapplicable }) => {
-        const item = RADIAL_ITEMS.find((candidate) => candidate.id === id)
-        if (!item) return []
-        const label = id === 'ocr-settings' ? (source === 'hooker' ? 'App settings' : 'OCR settings') : item.label
-        return [{ item, label, enabled: !inapplicable }]
-      }),
-    [menu, source]
-  )
+  const shown = useMemo(() => shownRadialItems(menu, source), [menu, source])
 
   const save = (next: string[]): void => void setStored(next)
 
@@ -371,22 +378,7 @@ export function RadialMenuSection(): ReactNode {
     [hotkeys, setHotkeys]
   )
 
-  /** Each item's shortcut, for the ring: its controller buttons, or else its keys. */
-  const details = useMemo(() => {
-    const result: Record<string, string | undefined> = {}
-    for (const item of RADIAL_ITEMS) {
-      const binding = hotkeys[item.hotkey]
-      if (!binding) continue
-      const chord = gamepadChord(binding)
-      result[item.id] =
-        chord.length > 0
-          ? chord.map((button) => getButtonName(button, padLayout)).join(' + ')
-          : binding.accelerator
-            ? formatAccelerator(binding.accelerator, keyPlatform)
-            : undefined
-    }
-    return result
-  }, [hotkeys, keyPlatform, padLayout])
+  const details = useRadialShortcuts()
 
   const open = selected ? RADIAL_ITEMS.find((item) => item.id === selected) : undefined
 
@@ -453,6 +445,8 @@ export function RadialMenuSection(): ReactNode {
         items={shown}
         selected={selected}
         details={details}
+        color={color}
+        base={base}
         source={source}
         onSource={setSource}
         onPick={setSelected}
@@ -470,6 +464,8 @@ export function RadialMenuSection(): ReactNode {
           )
         }
       />
+      {/* Its look, as in Settings → Overlay → Radial menu. */}
+      {controls}
       {/* The ring is drawn for the pointer; these open the same panels from the keyboard. */}
       <ul className="sr-only">
         {inMenu.map((item) => (

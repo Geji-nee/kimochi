@@ -1,8 +1,9 @@
 /**
  * Settings → Overlay: what Kimochi draws over your source and how it behaves (overlay mode,
  * grouping, the furigana and language filters, click-through, hiding it from recordings), how it
- * looks (`OverlayLook`), the Text Hooker's card as it looks over a game, set in Settings → Text
- * Hooker (`TextHookerCardSection`, Windows and Linux), and Game Mode, how Read along shows the dictionary
+ * looks (`OverlayLook`, and the dictionary pop-up's opacity, `DictionaryOpacityRow`), the Text Hooker's card as it looks over
+ * a game, set in Settings → Text Hooker (`TextHookerCardSection`, Windows and Linux), the radial menu
+ * (`RadialMenuSection`, as in Shortcuts & Controls), and Game Mode, how Read along shows the dictionary
  * (`GameModeSection`). Choosing the OCR engine and Auto OCR are on Settings → OCR.
  */
 import type { ReactNode } from 'react'
@@ -17,6 +18,8 @@ import { SmallTextFilter } from './SmallTextFilter'
 import { GameModeSection } from './GameModeSection'
 import { TextHookerCardSection } from './TextHookerCardSection'
 import { GamePauseRow } from './GamePauseRow'
+import { DictionaryOpacityRow } from './DictionaryOpacityRow'
+import { RadialMenuSection } from './RadialMenuSection'
 
 export function OverlayTab(): ReactNode {
   const [liveOverlayEnabled, setLiveOverlayEnabled] = useSetting<boolean>('liveOverlayEnabled', false)
@@ -111,14 +114,14 @@ export function OverlayTab(): ReactNode {
 
       <SettingsSection
         title="Overlay appearance"
-        description="How scanned text is marked on your source, and the card it turns into when you hover it."
+        description="How scanned text is marked on your source, the card it turns into when you hover it, and the dictionary pop-up."
       >
         <OverlayLook />
         {(locked || cardLocked) && (
           <SettingsRow
             label="Outline the word being looked up"
             controlId="ocr-match-outline"
-            description="Text drawn Transparent shows nothing of what you look up. With this on, a faint outline marks the word the dictionary matched while its pop-up is open, as Read along does."
+            description="Only for Transparent: shows a faint outline over the word being looked up, as Read along does."
           >
             <Switch
               id="ocr-match-outline"
@@ -127,9 +130,12 @@ export function OverlayTab(): ReactNode {
             />
           </SettingsRow>
         )}
+        <DictionaryOpacityRow />
       </SettingsSection>
 
       <TextHookerCardSection />
+
+      <RadialMenuSection />
 
       <GameModeSection />
     </SettingsPage>

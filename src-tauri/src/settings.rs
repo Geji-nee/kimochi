@@ -99,6 +99,14 @@ pub fn defaults() -> Value {
         // The overlay's highlight colour, its cards' appearance and the highlight's opacity
         // (ui/settings.ts DEFAULT_OVERLAY_STYLE); `app` follows Kimochi's own appearance.
         "overlayStyle": { "color": "#3e63dd", "appearance": "app", "opacity": 40 },
+        // How opaque every engine's dictionary pop-up is drawn (Settings → Overlay), 10–100.
+        "dictionaryPopupOpacity": 100,
+        // The radial menu's colour (Settings → Overlay → Radial menu); null until chosen, when it
+        // keeps the overlay's highlight colour (ui/settings.ts `radialMenuColorOf`).
+        "radialMenuColor": null,
+        // The radial menu's ring: its base colour and how opaque (10–100), ui/settings.ts
+        // `radialMenuBaseOf`.
+        "radialMenuBase": { "color": "#111113", "opacity": 70 },
         // Sentence audio (sentence_audio/): off until the user turns it on.
         "sentenceAudio": {
             "voiceHook": true,

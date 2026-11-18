@@ -21,7 +21,8 @@ import { activePadLayout, setPadLayout } from './pad-layout.js'
 import { createPopupFocus, YOMITAN_FOCUS } from './popup-focus.js'
 import { ReadingHold } from './reading-hold.js'
 import { installPointerDiagnostics, pointerTrace, pointerTracing } from './pointer-diagnostics.js'
-import { PopupLeave } from './popup-leave.js'
+import { PopupLeave, gapBetween, inRect, lineAround } from './popup-leave.js'
+import { boundingRect } from './popup-geometry.js'
 /* eslint @typescript-eslint/explicit-function-return-type: "off" -- Plain JS runtime glue. */
 /**
  * The overlay window: Yomitan host, text renderer and scan orchestrator.
@@ -102,6 +103,8 @@ import {
   clickThroughLocked,
   hookCardLocksAutoAlign,
   overlayStyleOf,
+  radialBaseVars,
+  radialMenuColorOf,
   resolveHookCardAppearance,
   resolveHostEngine,
   resolveOverlayCardAppearance,
@@ -150,6 +153,18 @@ function hoverLookup() {
     { gamescope: nativeGamescope, wayland: waylandSession, lookupOnHover },
     native.getSetting('overlayHoverLookup')
   )
+}
+/**
+ * Look up on hover with 10ten: 10ten hovers by itself, as in a browser (host/ext/app.js
+ * `bareHover`), so every plain pointer move looks up and the pop-up glides from word to word.
+ * The overlay then adds no key to the moves it hands it (a held Shift would ask 10ten for kanji).
+ */
+function tentenBareHover() {
+  return extensionHosted && window.__kimochiExtensionHost?.descriptor?.id === 'tenten' && hoverLookup()
+}
+/** Tell the extension host whether 10ten hovers by itself; it does nothing when unchanged. */
+function syncTentenBareHover() {
+  window.__kimochiExtensionHost?.bareHover?.(tentenBareHover())
 }
 /** Linux on Wayland (`caps.session.backend`): hover lookup does not apply there (`hoverLookupApplies`). */
 let waylandSession = false
@@ -891,7 +906,8 @@ controller = createController({
   buttons: () => setting('controllerButtons'),
   menuItems: () => setting(RADIAL_MENU_SETTING),
   appearance: () => setting('appearance'),
-  ringColor: () => setting('overlayStyle')?.color,
+  ringColor: () => radialMenuColorOf(setting('radialMenuColor'), setting('overlayStyle')),
+  ringBase: () => radialBaseVars(setting('radialMenuBase')),
   // Gaming Mode reads the Deck's own controller. Paused Steam lets it fall back to its keyboard
   // and mouse "lizard" mode, whose arrow keys would move the outline a second time.
   padOnly: () => window.__KIMOCHI_PLATFORM__?.os === 'linux' && nativeGamescope,
@@ -4552,26 +4568,128 @@ async function importFixtureDictionary() {
  * dismissal sends commands and synthetic events).
  */
 /**
- * Windows: the dictionary pop-up closes once the pointer has left the words and the pop-up
- * (ui/popup-leave.ts). A hover there no longer takes the keyboard, so the click or Escape that
- * would otherwise close it would reach the game too. Not while the controller reads.
+ * The dictionary pop-up closes once the pointer has left the words and the pop-up
+ * (ui/popup-leave.ts). On Windows without click-through: a hover there no longer takes the
+ * keyboard, so the click or Escape that would otherwise close it would reach the game too. With
+ * look up on hover, everywhere: there is no click away. Not while the controller reads.
  */
 const popupLeave = new PopupLeave()
+/**
+ * Look up on hover: the pop-up goes once the pointer has been off the line, the gap and the
+ * pop-up for a moment: long enough that a pointer slipping off the line on its way along it
+ * doesn't close it, short enough to read as going when the pointer moves on.
+ */
+const hoverPopupLeave = new PopupLeave(250)
+/** After dismissal, wait for movement or a return to text before allowing another hover lookup. */
+let hoverPaused = false
+function syncHoverPause(pointer) {
+  if (!hoverPaused) return
+  hoverPaused = feedHover && !renderer.hitRects(state.origin).some((r) => inRect(r, pointer.x, pointer.y))
+}
+/**
+ * The Yomitan API's pop-ups, in desktop points (`popover:cards`): windows of their own, so neither
+ * `livePopups` nor the extension's rectangle sees them.
+ */
+let apiPopupCards = []
+void native.listen('popover:cards', ({ payload }) => {
+  apiPopupCards = Array.isArray(payload) ? payload : []
+  checkPopupLeave()
+})
 let popupLeavePointer = null
+let notedPopupLeaveError = false
 let popupLeaveTimer = null
 function checkPopupLeave(pointer = popupLeavePointer) {
   popupLeavePointer = pointer
-  // With click-through, a click away is free (`onFreeClick`), so the pop-up stays until then.
-  if (window.__KIMOCHI_PLATFORM__?.os !== 'windows' || controller.drivesLookups || clickThrough('words')) return
-  const open = Boolean(extensionPopupRect) || [...livePopups].some((popup) => popup.isVisibleSync?.())
+  if (controller.drivesLookups) return
+  // Look up on hover, on every platform: a pop-up no longer takes the next click (`catching`), so
+  // nothing else closes it. It goes once the pointer is off the word's line and off the pop-up.
+  const hover = hoverLookup()
+  // Otherwise, with click-through, a click away is free (`onFreeClick`), so the pop-up stays until then.
+  if (!hover && (window.__KIMOCHI_PLATFORM__?.os !== 'windows' || clickThrough('words'))) return
+  const open =
+    Boolean(extensionPopupRect) ||
+    (hover && apiPopupCards.length > 0) ||
+    [...livePopups].some((popup) => popup.isVisibleSync?.())
   clearTimeout(popupLeaveTimer)
-  if (popupLeave.update(performance.now(), pointer, hitRects(), open)) {
+  const leave = hover ? hoverPopupLeave : popupLeave
+  // Nothing to measure with no pop-up up: `update` only resets then.
+  const rects = !open ? [] : hover ? hoverLeaveRects() : hitRects()
+  if (leave.update(performance.now(), pointer, rects, open)) {
     log({ check: 'popup-left' })
     dismissPopup()
+    if (hover) {
+      window.getSelection()?.removeAllRanges()
+      hoverPaused = true
+    }
     return
   }
-  const wait = popupLeave.remaining(performance.now())
+  const wait = leave.remaining(performance.now())
   if (wait !== null) popupLeaveTimer = setTimeout(() => checkPopupLeave(), wait + 20)
+}
+
+/** The CSS highlights the extension engines mark their match with (overlay-text.css). */
+const MATCH_HIGHLIGHTS = ['tenten-selection', 'tenten-selection-blue', 'gsm-hoshidicts-match']
+
+/**
+ * Keep hover popups open over the match, its line, the popups and the gaps between them.
+ * All rectangles are in screen points. Without a match, fall back to the full hit regions.
+ */
+function hoverLeaveRects() {
+  const origin = state.origin
+  if (!origin) return []
+  const toScreen = (r) => ({ x: origin.x + r.left, y: origin.y + r.top, width: r.width, height: r.height })
+  const rangeRects = (range) => [...range.getClientRects()].filter((r) => r.width > 0 && r.height > 0).map(toScreen)
+  // 10ten marks its match with StaticRanges, which have no rects of their own: a live Range over
+  // the same text has. Asking theirs threw on every pointer sample while its pop-up was up, so no
+  // move reached it and the pop-up stuck on the first word.
+  const live = (range) => {
+    if (typeof range.getClientRects === 'function') return range
+    try {
+      const copy = document.createRange()
+      copy.setStart(range.startContainer, range.startOffset)
+      copy.setEnd(range.endContainer, range.endOffset)
+      return copy
+    } catch {
+      return null
+    }
+  }
+  const ranges = []
+  const selection = window.getSelection()
+  if (selection && !selection.isCollapsed)
+    for (let i = 0; i < selection.rangeCount; i++) ranges.push(selection.getRangeAt(i))
+  for (const name of MATCH_HIGHLIGHTS)
+    for (const range of globalThis.CSS?.highlights?.get(name) ?? []) {
+      const usable = live(range)
+      if (usable) ranges.push(usable)
+    }
+  const word = ranges.flatMap(rangeRects)
+  const wordBox = boundingRect(word)
+  if (!wordBox) return hitRects()
+  // The text's direction and size, from the text itself: a single letter is taller than wide, and
+  // a block of short lines too.
+  const elements = ranges.map((range) => {
+    const node = range.startContainer
+    return node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement
+  })
+  const style = getComputedStyle(elements[0])
+  const vertical = style.writingMode.startsWith('vertical')
+  const em = parseFloat(style.fontSize) || (vertical ? wordBox.width : wordBox.height)
+  // The line as drawn, which may run past its box: Yomitan looks up on every glyph, so a kept area
+  // ending at the box's edge closed and reopened the pop-up there.
+  const drawn = []
+  for (const host of new Set(elements.map((element) => element?.closest('[data-ocr-word-box], .hook-card-text')))) {
+    if (!host) continue
+    const all = document.createRange()
+    all.selectNodeContents(host)
+    drawn.push(...rangeRects(all))
+  }
+  const line = lineAround(wordBox, renderer.hitRects(origin), drawn, vertical, em)
+  const popups = popupRects()
+  if (extensionPopupRect)
+    popups.push({ ...extensionPopupRect, x: origin.x + extensionPopupRect.x, y: origin.y + extensionPopupRect.y })
+  popups.push(...apiPopupCards)
+  const near = line ? boundingRect([wordBox, line]) : wordBox
+  return [...word, ...(line ? [line] : []), ...popups, ...popups.map((popup) => gapBetween(near, popup))]
 }
 
 function dismissPopup() {
@@ -4963,10 +5081,9 @@ function hookCardClear() {
 
 /** Whether a point (overlay coordinates) is on a dictionary pop-up in this window. */
 function overPopupAt(local) {
-  const inside = (rect, x, y) => x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
-  if (extensionPopupRect && inside(extensionPopupRect, local.x, local.y)) return true
+  if (extensionPopupRect && inRect(extensionPopupRect, local.x, local.y)) return true
   const origin = state.origin
-  return Boolean(origin) && popupRects().some((rect) => inside(rect, local.x + origin.x, local.y + origin.y))
+  return Boolean(origin) && popupRects().some((rect) => inRect(rect, local.x + origin.x, local.y + origin.y))
 }
 
 /** Whether a dictionary pop-up is showing in this window. */
@@ -5551,6 +5668,7 @@ await native.watchSettings((key) => {
   }
   // Mirror only: a switch is reloaded by Settings (`dictionary_engine_apply`), not from here.
   if (key === 'yomitanSettings') void mirrorDictionaryEngine()
+  if (key === 'overlayHoverLookup') checkPopupLeave()
   if (key === 'overlayStyle' || key === 'appearance') {
     applyOverlayStyle()
     // The hint bar shows only while something is drawn (the card follows in `draw`, below).
@@ -5978,7 +6096,7 @@ function rekeyForHover(event) {
   if (controller.drivesLookups) return
   const key = native.getSetting('overlayLookupKey')
   const button = feedLookupButton && isLookupButton(key)
-  if (!button && (!feedHover || !hoverLookup())) return
+  if (!button && (!feedHover || hoverPaused || !hoverLookup() || tentenBareHover())) return
   const property = lookupKeyProperty(key)
   if (event[property] || (event.buttons & ~lookupButtonsBit(button ? key : null)) !== 0) return
   if (!button && overPopupAt({ x: event.clientX, y: event.clientY })) return
@@ -6070,13 +6188,23 @@ await native.listen('pointer', ({ payload }) => {
       syncHookCard()
     }
   }
-  const armed = !clickThrough('words') || gateOpen
+  // Look up on hover lights the word under the pointer as the lookup key would: the reader is
+  // looking words up just by pointing. Clicks still go to the game (native's regions follow the key).
+  const armed = !clickThrough('words') || gateOpen || hoverLookup()
   if (local) hints.pointer(local.x, local.y)
   // A drag of the Text Hooker's card follows the pointer and nothing else does meanwhile.
   // The card clear of the game is the reader's to click without the key (`hookCardClear`).
   const cardArmed = !clickThrough('card') || gateOpen || hookCardClear()
   if (local && hook.card?.pointer(local.x, local.y, Boolean(payload.down), cardArmed)) return
-  checkPopupLeave(payload.over === false || !local ? null : { x: payload.x, y: payload.y })
+  // Never in the way of the scan below: a throw here once stopped every move reaching 10ten.
+  try {
+    checkPopupLeave(payload.over === false || !local ? null : { x: payload.x, y: payload.y })
+  } catch (error) {
+    if (!notedPopupLeaveError) {
+      notedPopupLeaveError = true
+      log({ check: 'popup-leave-error', error: String(error?.message ?? error) })
+    }
+  }
   // Yomitan's popups hear the pointer enter and leave them, for "Hide popup on cursor exit" (#95).
   // Not while the controller reads: the resting mouse is not the reader's.
   if (trackPopupHover && !extensionHosted && !controller.drivesLookups) {
@@ -6094,7 +6222,14 @@ await native.listen('pointer', ({ payload }) => {
   // somewhere else would otherwise close the controller's popup.
   if (!state.yomitan.ready || controller.drivesLookups) return
   // Hover lookup: a resting pointer looks up as if the lookup key were held (not over a pop-up).
-  const scanned = withHoverKey(payload, hoverLookup(), native.getSetting('overlayLookupKey'), overPopupAt(local))
+  syncHoverPause(payload)
+  syncTentenBareHover()
+  const scanned = withHoverKey(
+    payload,
+    hoverLookup() && !hoverPaused && !tentenBareHover(),
+    native.getSetting('overlayLookupKey'),
+    overPopupAt(local)
+  )
   const init = scanPointerInit(scanned, local, performance.now() - lastRealPointer, lastRealModifiers)
   // Over Yomitan's own popup the sample is the popup's: its scanner opens a nested popup for the
   // word under it. The page's scanner would only ignore it.
@@ -6261,6 +6396,8 @@ if (window.__KIMOCHI_PLATFORM__?.os === 'linux') {
               controllerButtons: setting('controllerButtons'),
               controllerMenuItems: setting(RADIAL_MENU_SETTING),
               overlayStyle: setting('overlayStyle'),
+              radialMenuColor: setting('radialMenuColor'),
+              radialMenuBase: setting('radialMenuBase'),
               appearance: setting('appearance')
             }
           }

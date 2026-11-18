@@ -8,10 +8,14 @@
 }
 /* The live preview across the group's width, inset by the row padding. */
 .overlay-look-stage {
-  padding: var(--k-space-3);
+  /* No inset below: the controls' dividers run up to meet the well. */
+  padding: var(--k-space-3) var(--k-space-3) 0;
 }
+/* Taller, with the line low, to leave room for the dictionary pop-up over its hovered word. */
 .overlay-look-stage .overlay-look-preview {
-  height: 8.5rem;
+  height: 15rem;
+  align-items: flex-end;
+  padding-bottom: 1.5rem;
 }
 .overlay-look-stage .overlay-look-scene {
   gap: 0.5rem;
@@ -23,12 +27,12 @@
 .overlay-look-stage .overlay-look-cell .ocr-word {
   --ocr-pad: 7px;
 }
-/* One box under the stage, its three parts side by side and parted by rules; one under another
+/* One box under the stage, its three parts side by side and parted by rules that meet the well
+   above (no rule across); one under another
    in a narrow window. */
 .overlay-look-controls {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  border-top: 1px solid var(--k-line);
 }
 .overlay-look-control {
   display: flex;
@@ -54,6 +58,64 @@
   color: var(--k-text-3);
   font-size: var(--k-text-sm);
   line-height: var(--k-leading-sm);
+}
+/* The rows under the preview and its three controls (Outline the word being looked up, then
+   Dictionary opacity) start with a rule, as rows after rows do, closing off the box above. */
+.overlay-look + .k-settings-row {
+  border-top: 1px solid var(--k-line);
+}
+/* Dictionary opacity's slider (DictionaryOpacityRow.tsx), on the right of its row. */
+.dictionary-opacity-control {
+  width: 14rem;
+}
+
+/* The faint outline over the looked-up word on Transparent text, as the overlay draws it
+   (ui/controller.css `.cm-word` with `.cm-word-match`, 3px out from the word). */
+.overlay-look-outline {
+  position: absolute;
+  inset: -3px;
+  z-index: 3;
+  box-sizing: border-box;
+  border: 2px solid #7dd3fc;
+  border-radius: 7px;
+  background: rgb(125 211 252 / 0.1);
+  opacity: 0.6;
+  pointer-events: none;
+}
+
+/* The dictionary pop-up over the hovered word, at its opacity: the game shows through it. */
+.overlay-look-popup {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 0.875rem);
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 0.375rem;
+  width: 11rem;
+  padding: 0.625rem 0.75rem 1rem;
+  border-radius: var(--k-radius-md);
+  background: var(--k-raised);
+  color: var(--k-text);
+  box-shadow:
+    0 6px 14px -4px rgb(0 0 0 / 0.4),
+    inset 0 0 0 1px var(--k-line);
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+.overlay-look-popup-term {
+  font-size: 1rem;
+  line-height: 1.375rem;
+  font-weight: var(--k-weight-semibold);
+}
+/* Definition lines, drawn as bars so the example reads in any language. */
+.overlay-look-popup-gloss {
+  height: 0.375rem;
+  border-radius: 999px;
+  background: var(--k-line-strong);
+}
+.overlay-look-popup-gloss[data-short] {
+  width: 60%;
 }
 .overlay-look-label {
   font-size: var(--k-text-md);
@@ -184,6 +246,13 @@
 .overlay-look-presets {
   display: contents;
 }
+/* A light swatch (white, silver): its tick in dark ink. */
+.overlay-look-swatch[data-light] {
+  color: #1c2024;
+}
+.overlay-look-swatch[data-light] svg {
+  filter: none;
+}
 .overlay-look-swatch {
   position: relative;
   display: flex;
@@ -195,7 +264,12 @@
   border: 0;
   border-radius: 999px;
   background: var(--swatch);
-  box-shadow: inset 0 0 0 1px rgb(0 0 0 / 0.14);
+  /* Lit from the top left, shaded at the bottom right, on a soft shadow: a dark swatch still
+     stands off a dark ground. */
+  box-shadow:
+    inset 1px 1px 0 rgb(255 255 255 / 0.22),
+    inset -1px -1px 0 rgb(0 0 0 / 0.28),
+    0 1px 3px rgb(0 0 0 / 0.35);
   color: #fff;
   cursor: default;
   transition:
@@ -206,13 +280,7 @@
 .overlay-look-swatch[data-native-hover] {
   transform: scale(1.1);
 }
-/* Chosen: a ring in its own colour, parted from the swatch by the window's ground. */
-.overlay-look-swatch[data-state='on'] {
-  box-shadow:
-    inset 0 0 0 1px rgb(0 0 0 / 0.14),
-    0 0 0 2px var(--k-bg),
-    0 0 0 3.5px var(--swatch);
-}
+/* Chosen: its tick shows (below), nothing more. */
 .overlay-look-swatch svg {
   width: var(--k-icon-xs);
   height: var(--k-icon-xs);
