@@ -1,6 +1,7 @@
 //! Clean per-sound captures, selected without a speech model. The system listener remains the fallback.
 pub mod classify;
 pub mod feed;
+pub mod words;
 use crate::timeline::Line;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +51,8 @@ pub struct Report {
     pub typing_ms: f64,
     /// How long before a line's arrival its voice may start (learned like the lag).
     pub lead_ms: f64,
+    /// Lines given their clip by its words (`words`), of `matched`.
+    pub by_words: usize,
     pub groups: Vec<classify::Verdict>,
     pub error: Option<String>,
 }
@@ -146,6 +149,14 @@ pub struct Hooked {
     /// Enough voices have taught the timing (or an earlier session did): a voice starting well
     /// after a line can be that line's, rather than the next line's still being typed out.
     settled: bool,
+    /// Clips heard by the recogniser (`words`), by capture and sequence.
+    heard: BTreeMap<(PathBuf, u64), crate::matching::Heard>,
+    /// Lines given their clip by its words: not checked again.
+    worded: BTreeSet<String>,
+    /// How each line (by uid and text) fits each heard clip (`words::fit`), worked out once.
+    fits: BTreeMap<(String, String, words::Key), Option<words::Fit>>,
+    /// What the words pass last decided on (lines, matches, clips taken, clips heard), and when.
+    words_state: words::State,
 }
 impl Default for Hooked {
     fn default() -> Self {
@@ -158,6 +169,10 @@ impl Default for Hooked {
             remembered_typing: None,
             voice_groups: Vec::new(),
             settled: false,
+            heard: BTreeMap::new(),
+            worded: BTreeSet::new(),
+            fits: BTreeMap::new(),
+            words_state: ((0, 0, 0, 0), f64::NEG_INFINITY),
             feeds: BTreeMap::new(),
             lines: Vec::new(),
             used: BTreeSet::new(),
@@ -179,11 +194,13 @@ impl Hooked {
         if self.lines.len() > 500 {
             let old = self.lines.remove(0);
             self.done.remove(&old.uid);
+            self.worded.remove(&old.uid);
         }
     }
     pub fn forget(&mut self, uids: &[String]) {
         self.lines.retain(|l| !uids.contains(&l.uid));
         for uid in uids {
+            self.worded.remove(uid);
             if let Some(key) = self.done.remove(uid) {
                 // A clip shared by the rows of one quote stays taken while another row has it.
                 if !self.done.values().any(|k| *k == key) {
@@ -230,6 +247,10 @@ impl Hooked {
     }
     pub fn retry(&mut self, uid: &str) {
         self.done.remove(uid);
+    }
+    /// `uid` was given its clip by the clip's words (`words`), not by timing.
+    pub fn by_its_words(&self, uid: &str) -> bool {
+        self.worded.contains(uid) && self.done.contains_key(uid)
     }
     pub fn completed(&self, uid: &str) -> bool {
         self.done.contains_key(uid)
@@ -480,6 +501,14 @@ impl Hooked {
         // better is the voice and the other is set aside, so a line's voice comes from one of them.
         let groups = &self.report.groups;
         let echo = |a: &classify::Verdict, b: &classify::Verdict| classify::echoes(&all, &a.group, &b.group);
+        // Nor is a group that also starts with its lines, near enough every time, but with other
+        // lines: another character's voice in another format.
+        let (lead_ms, lag_ms) = (self.report.lead_ms, self.report.lag_ms);
+        let apart = |a: &classify::Verdict, b: &classify::Verdict| {
+            a.with_lines >= 0.75
+                && b.with_lines >= 0.75
+                && classify::shared_lines(&all, &lines, &a.group, &b.group, lead_ms, lag_ms) < 0.34
+        };
         // The game's remembered voice stream first; then a named one; then the one that hears each
         // sound once (`classify::per_sound`); then the score.
         let remembered = |v: &classify::Verdict| self.remembered.as_ref() == Some(&v.group);
@@ -502,6 +531,7 @@ impl Hooked {
                                         && (sounds(other) || other.named)
                                         && other.voice >= v.voice - 0.15
                                         && !echo(v, other)
+                                        && !apart(v, other)
                                 })))
             })
             .collect();
@@ -558,6 +588,8 @@ impl Hooked {
                     && c.dur >= 0.15
                     && c.dur <= 30.0
                     && classify::candidate(c, &voice)
+                    // An effect sharing the voice's format, played again (`classify::repeated`).
+                    && !classify::repeated(c, &all)
             })
             .collect();
         // Of the pieces an adapter makes of one sound (`classify::per_sound`: the archive's partial

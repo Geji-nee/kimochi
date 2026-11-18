@@ -19,10 +19,13 @@
 pub mod clean;
 pub mod pick;
 pub mod process;
+mod renpy;
+mod rpgmaker;
 pub mod store;
 mod translations;
 mod unity;
 pub mod wine;
+mod witness;
 
 use crate::language::Language;
 use crate::state::Shared;
@@ -58,8 +61,26 @@ const IL2CPP_STARTUP: Duration = Duration::from_secs(20);
 const GLYPHS: u32 = 3;
 /// Lines from other engine threads, with the chosen one silent, after which the screen is read again.
 const MISSED_LINES: u32 = 3;
+/// Lines other threads send this close together are one click's: the same line in its several
+/// forms (a row, the whole line, the box with the text before it), however many threads send it.
+const MISS_GAP: Duration = Duration::from_millis(1500);
 /// Pieces in a row in another language after which a chosen thread hands over to one in the language.
 const FOREIGN_LINES: u32 = 3;
+/// The least time between two readings that vouch for the chosen thread (`witness`): a reading
+/// costs a few hundred milliseconds of CPU, and a game the screen cannot settle (a menu, an
+/// unreadable font) would otherwise be read at every line another thread sends.
+const WITNESS_GAP: Duration = Duration::from_secs(4);
+/// Each reading that finds the chosen thread's line on screen doubles the gap before the next, up
+/// to this: a thread that keeps showing the lines needs no reading at every click (SiglusEngine's
+/// script-label threads send at every one). A chosen thread silent for `WITNESS_SILENT` is read
+/// for at the shortest gap again: one that has stopped is found as quickly as before.
+const WITNESS_MAX_GAP: Duration = Duration::from_secs(60);
+const WITNESS_SILENT: Duration = Duration::from_secs(10);
+/// Readings in a row that could not tell, with the chosen thread silent through them, after which
+/// lines missed drop it without the screen's word (a game the screen cannot settle).
+const WITNESS_UNSURE: u32 = 3;
+/// How many of the last lines sent the screen may still show for the hook to be ahead of it.
+const WITNESS_EARLIER: usize = 4;
 
 #[derive(Debug, Clone)]
 struct Thread {
@@ -89,6 +110,8 @@ struct Thread {
     /// A Unity text box that keeps earlier sentences on screen: its text before the sentence now
     /// being shown (markup aside), so that sentence carrying on is the Log's line, not the box.
     box_start: String,
+    /// Its latest text differs from the one before it: a line, not a label drawn again.
+    fresh: bool,
 }
 
 impl Thread {
@@ -118,11 +141,36 @@ struct Session {
     /// Lines other threads have sent since the chosen one last spoke, and the last of them.
     missed: u32,
     missed_text: String,
+    /// When the last of them was counted, and the thread chosen when they were: lines missed are
+    /// the chosen thread's, counted afresh for each choice and not at all while none is made.
+    missed_at: Option<Instant>,
+    missed_for: Option<String>,
     pick_note: Option<String>,
     /// Why an earlier engine was given up for the one in use.
     fallback: Option<String>,
     pick_pending: bool,
     pick_running: bool,
+    /// A reading of the window to vouch for the chosen thread is under way (`witness`), and when
+    /// the last one started: one at a time, and no more often than `WITNESS_GAP`.
+    witness_running: bool,
+    witness_at: Option<Instant>,
+    /// The gap before the next reading (`WITNESS_MAX_GAP`); none yet: `WITNESS_GAP`.
+    witness_gap: Option<Duration>,
+    /// The window has been read for the chosen thread: from then on, missed lines alone drop it
+    /// only after `WITNESS_UNSURE` readings in a row could not tell (`unsure`).
+    witness_reads: bool,
+    unsure: u32,
+    /// The thread the last reading found on screen, and when.
+    vouched: Option<(String, Instant)>,
+    /// The last few lines sent, newest first: the screen still showing one of them says the hook
+    /// is ahead of it.
+    sent: VecDeque<String>,
+    /// Threads given up this session for missing lines: never taken back as the game's remembered
+    /// thread, which would hand them the choice again as soon as they speak.
+    dropped: Vec<String>,
+    /// An RPG Maker game's actors' names, read the first time a line has a code in it
+    /// (`rpgmaker::actor_names`).
+    actor_names: Option<Vec<String>>,
     last_line: Option<String>,
     /// The id the last line was sent with: a line carried on in the next burst replaces it.
     last_id: Option<String>,
@@ -237,10 +285,13 @@ impl Hook {
         // clicked on to comes later than that.
         let window = (JOIN_BASE + JOIN_PER_CHAR * session.last_piece_chars as u32).min(CARRY_ON);
         // Rows are joined for engines that hand over a row at a time, never for a Unity text box,
-        // which is set whole.
+        // which is set whole, nor Ren'Py's say screen, whose lines come whole as they are shown.
         let recent = session.last_key.as_deref() == Some(key)
             && session.last_sent.is_some_and(|at| at.elapsed() < window)
-            && !session.threads.iter().any(|t| t.key == key && unity::is_unity(&t.hookcode));
+            && !session
+                .threads
+                .iter()
+                .any(|t| t.key == key && (unity::is_unity(&t.hookcode) || renpy::is_renpy(&t.hookcode)));
         let piece_chars = text.chars().count();
         if !carries_on && config.join_lines && recent {
             if let Some(before) = session.last_line.as_deref() {
@@ -264,6 +315,12 @@ impl Hook {
         session.last_sent = Some(Instant::now());
         session.last_piece_chars = piece_chars;
         session.last_line = Some(text.to_string());
+        // A line carried on replaces the last one.
+        if carries_on && session.last_id.is_some() {
+            session.sent.pop_front();
+        }
+        session.sent.push_front(text.to_string());
+        session.sent.truncate(WITNESS_EARLIER);
         let replaces = if carries_on { session.last_id.take() } else { None };
         // When the game set the text, if the source says (the Unity text, timed by the DLL on the
         // clock its voice clips are timed by); else now.
@@ -558,6 +615,7 @@ fn read_events(
                         japanese: false,
                         foreign: 0,
                         box_start: String::new(),
+                        fresh: false,
                     });
                 }
                 continue;
@@ -633,11 +691,11 @@ fn failed_hook(message: &str) -> Option<String> {
     Some(rest.split_whitespace().next().unwrap_or("").to_string())
 }
 
-/// The voice hook DLL reads this Unity game's text (`unity.rs`). With `then_hooker`, the text
-/// hooker starts once the DLL is watching the text (or has said it cannot), so that the DLL's
-/// breakpoint is in before the hooker patches the same function: a hooker that patches it after
-/// copies the breakpoint along, which the DLL follows; one that patched it first leaves the DLL
-/// out.
+/// The voice hook DLL reads this Unity game's text (`unity.rs`), or this Ren'Py game's dialogue
+/// (`renpy.rs`). With `then_hooker`, the text hooker starts once the DLL is watching the text (or
+/// has said it cannot), so that the DLL's breakpoint is in before the hooker patches the same
+/// function: a hooker that patches it after copies the breakpoint along, which the DLL follows; one
+/// that patched it first leaves the DLL out.
 fn read_unity_text(hook: &'static Hook, session: &mut Session, then_hooker: bool) {
     let mut then_hooker = then_hooker;
     for target in session.targets.clone() {
@@ -683,6 +741,12 @@ fn read_unity_text(hook: &'static Hook, session: &mut Session, then_hooker: bool
 fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
     let language = hook.language();
     let Some(index) = session.threads.iter().position(|t| t.key == key) else { return };
+    // An RPG Maker message's actor codes as the actors' names.
+    if text.contains('\\') && session.actor_names.is_none() {
+        session.actor_names = Some(session.exe.as_deref().map(rpgmaker::actor_names).unwrap_or_default());
+    }
+    let named = rpgmaker::with_names(text, session.actor_names.as_deref().unwrap_or_default());
+    let text = named.as_str();
     // A line sent with its translations (a multilingual release) is the line in the language being
     // read; a line drawn several times over (CatSystem2) is the line once.
     let own = translations::in_language(text, language);
@@ -703,9 +767,13 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
     let (lines, carries_on) = {
         let thread = &session.threads[index];
         let recent = thread.last_at.is_some_and(|at| at.elapsed() < CARRY_ON);
+        // Ren'Py's say screen sends a line as it is shown, whole: shown further after a pause in it
+        // (`{w}`, `{p}`) or by an `extend`, it is the same line, which it replaces however late.
+        if renpy::is_renpy(&thread.hookcode) {
+            (vec![text.to_string()], renpy::carries_on(&thread.text, text))
         // A Unity text object's text arrives settled, the whole text box (`unity::Settle`): one line,
         // never frames of a typewriter to take apart.
-        if unity::is_unity(&thread.hookcode) {
+        } else if unity::is_unity(&thread.hookcode) {
             // One that extends the object's last carries it on, however late: a typewriter paused
             // for longer than it takes to settle (live Unity: 9 s between the pieces).
             // A sentence added under a finished one (a text box the game fills a sentence a
@@ -746,7 +814,9 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
     {
         let thread = &mut session.threads[index];
         // A text box keeps its whole text: the next sentence added is told by what is shown.
-        thread.text = screen.clone().unwrap_or_else(|| lines.last().cloned().unwrap_or_default());
+        let text_now = screen.clone().unwrap_or_else(|| lines.last().cloned().unwrap_or_default());
+        thread.fresh = text_now != thread.text;
+        thread.text = text_now;
         if let Some(start) = box_start {
             thread.box_start = start;
         }
@@ -765,6 +835,25 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
         while thread.recent.len() > 32 {
             thread.recent.pop_front();
         }
+    }
+    // Ren'Py's say screen is the game's dialogue as shown (`renpy.rs`): it takes over from whatever
+    // was chosen before it spoke (a hooker thread read off the title screen, or remembered), unless
+    // the reader chose by hand.
+    if renpy::is_dialogue(&session.threads[index].hookcode)
+        && session.selected.as_deref() != Some(key)
+        && session.selected_by != Some("manual")
+    {
+        crate::debug_report::trace(
+            &hook.app,
+            json!({ "check": "texthook-reselected", "from": session.selected, "to": key }),
+        );
+        if let Some(exe) = session.exe.clone() {
+            remember(hook, &exe, Some(session.threads[index].signature()));
+        }
+        session.selected = Some(key.to_string());
+        session.selected_by = Some("auto");
+        session.pick_note = None;
+        hook.publish(session);
     }
     if let Some(better) = cleaner_thread(session, index, language) {
         crate::debug_report::trace(
@@ -794,6 +883,7 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
             json!({ "check": "texthook-burst", "text": text, "lines": lines, "carriesOn": carries_on }),
         );
         session.missed = 0;
+        session.unsure = 0;
         session.screen = screen.clone();
         for (i, line) in lines.iter().enumerate() {
             hook.line(session, key, line, carries_on && i == 0);
@@ -806,31 +896,81 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
     // Markup aside (a TextMeshPro typewriter colours what it has shown: `<color=#ffffffff>…`), and
     // not the hooker's TextMeshPro setter while the DLL reads the same text objects: it sends each
     // line before the object settles, which is no line the chosen object missed.
+    // Nor the line the chosen thread has just shown, sent again by the others (SiglusEngine sends
+    // each line through several threads, some with the box's earlier text around it): counted as
+    // missed, the chosen thread was dropped every few lines.
     {
         let spoken = &session.threads[index];
         let shown = pick::normalize(&clean::strip_markup(text, false));
-        let dll_reads = !session.unity.is_empty();
+        let dll_reads = dll_reads_lines(session);
+        let chosen_thread = session.threads.iter().find(|t| session.selected.as_deref() == Some(t.key.as_str()));
+        let chosen_dialogue = chosen_thread.is_some_and(|t| renpy::is_dialogue(&t.hookcode));
+        let chosen = chosen_thread.map(|t| pick::normalize(&clean::strip_markup(&t.text, false))).unwrap_or_default();
         if pick::another_line(&session.missed_text, &shown, PICK_MIN_MATCH * pick::letter_scale(language), language)
+            && !pick::same_line(&chosen, &shown)
             && !pick::is_generic(&spoken.hookcode, &spoken.name)
             && !(dll_reads && unity::is_hooker_tmp_setter(&spoken.hookcode))
+            // Ren'Py's say screen misses no line: the others' are its labels, errors and lines to come.
+            && !chosen_dialogue
         {
-            session.missed = session.missed.saturating_add(1);
+            // One click's lines count once: SiglusEngine sends a line through several threads in
+            // several forms, often before the chosen thread's, which made three "missed" lines of
+            // every click and dropped a good thread while its line came in.
+            count_missed(session, Instant::now());
             session.missed_text = shown;
+            // The first suspicion: the screen says at once whether the chosen thread is fine.
+            witness_soon(hook, session);
         }
     }
     // A thread chosen automatically that has said one thing only and nothing since (a menu drawn
     // once, the largest text on screen when it was read), while this one keeps speaking; or one
     // that has missed the last few lines other threads sent (a hook that starts a thread per line,
-    // as Majiro's does beside the one that keeps going): the screen is read again.
-    if session.selected_by == Some("auto") && (session.threads[index].count >= 3 || session.missed >= MISSED_LINES) {
-        let stale =
-            session.threads.iter().find(|t| session.selected.as_deref() == Some(t.key.as_str())).is_some_and(|t| {
-                (t.count <= 1 && t.last_at.is_some_and(|at| at.elapsed() > Duration::from_secs(10)))
-                    || session.missed >= MISSED_LINES
+    // as Majiro's does beside the one that keeps going): the screen is read again. A thread taken
+    // back from an earlier run too, once it misses lines: SiglusEngine starts threads per scene
+    // (the context in their key), and the one remembered may be the last scene's.
+    // Lines missed count for nothing while the screen is being read about them, or soon after it
+    // showed the chosen thread's line (`witness_check`): SiglusEngine sends each line through
+    // several threads, a row at a time, and those came to three "missed" lines within a burst,
+    // dropping a thread whose line was on screen at every line.
+    let auto = session.selected_by == Some("auto");
+    let saved = session.selected_by == Some("saved");
+    // The hooker's TextMeshPro setter, chosen before the DLL read any line (a game drawing a glyph
+    // per object, whose setter the game calls for lines ahead of the one shown): once the DLL
+    // reads lines, the screen chooses again, from the DLL's (`pick_candidates`).
+    let hooker_left = (auto || saved)
+        && dll_reads_lines(session)
+        && session
+            .threads
+            .iter()
+            .any(|t| session.selected.as_deref() == Some(t.key.as_str()) && unity::is_hooker_tmp_setter(&t.hookcode));
+    let vouched = session.witness_running
+        || session
+            .vouched
+            .as_ref()
+            .is_some_and(|(key, at)| session.selected.as_ref() == Some(key) && at.elapsed() < WITNESS_GAP);
+    if (auto && session.threads[index].count >= 3) || ((auto || saved) && session.missed >= MISSED_LINES) || hooker_left
+    {
+        let stale = hooker_left
+            || session.threads.iter().find(|t| session.selected.as_deref() == Some(t.key.as_str())).is_some_and(|t| {
+                // Never Ren'Py's say screen, which speaks only when a line is shown: a reader on its
+                // first line for a while is no menu drawn once, whatever the hooker sends meanwhile.
+                (auto
+                    && t.count <= 1
+                    && !renpy::is_dialogue(&t.hookcode)
+                    && t.last_at.is_some_and(|at| at.elapsed() > Duration::from_secs(10)))
+                    || (session.missed >= MISSED_LINES && !vouched && unwitnessed(session))
             });
         if stale {
             session.missed = 0;
             crate::debug_report::trace(&hook.app, json!({ "check": "texthook-repick", "from": session.selected }));
+            if let Some(gone) = session.selected.clone() {
+                session.dropped.push(gone);
+            }
+            if saved {
+                if let Some(exe) = session.exe.clone() {
+                    remember(hook, &exe, None);
+                }
+            }
             session.selected = None;
             session.selected_by = None;
             hook.publish(session);
@@ -843,9 +983,10 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
     // TextMeshPro setter while the DLL reads the game's text objects themselves (the screen
     // chooses one of those instead).
     let saved = session.exe.as_deref().and_then(|exe| remembered(hook, exe));
-    let dll_reads = !session.unity.is_empty();
+    let dll_reads = dll_reads_lines(session);
     if unity::remembers_by_signature(&session.threads[index].hookcode)
         && saved.as_ref() == Some(&session.threads[index].signature())
+        && !session.dropped.iter().any(|k| k == key)
         && !(dll_reads && unity::is_hooker_tmp_setter(&session.threads[index].hookcode))
     {
         session.selected = Some(key.to_string());
@@ -871,11 +1012,25 @@ fn on_text(hook: &'static Hook, session: &mut Session, key: &str, text: &str) {
 /// names, its speakers' names and its ruby readings in it; when the screen is read they show the
 /// same line, and which is chosen is down to chance.
 fn cleaner_thread(session: &Session, index: usize, language: &Language) -> Option<String> {
+    // Never to the hooker's TextMeshPro setter while one of the DLL's text objects holds a line
+    // (`dll_reads_lines`): it mixes every object's text with layout's (`m`, `mm`, `mmm`).
+    let better = taking_over(session, index, language)?;
+    let hooker =
+        session.threads.iter().find(|t| t.key == better).is_some_and(|t| unity::is_hooker_tmp_setter(&t.hookcode));
+    (!(hooker && dll_reads_lines(session))).then_some(better)
+}
+
+fn taking_over(session: &Session, index: usize, language: &Language) -> Option<String> {
     let selected = session.selected.as_deref()?;
     if session.selected_by == Some("manual") {
         return None;
     }
     let chosen = session.threads.iter().find(|t| t.key == selected)?;
+    // Never from Ren'Py's say screen: it is the line as shown; a run of short lines (`え？`) is no
+    // glyph-per-object game, and the hooker's threads there carry its labels and lines to come.
+    if renpy::is_dialogue(&chosen.hookcode) {
+        return None;
+    }
     // A text object that showed the line once and has shown a glyph at a time since: a thread
     // showing whole lines takes over.
     let spoken = &session.threads[index];
@@ -968,37 +1123,11 @@ fn pick_loop(hook: &'static Hook, generation: u64) {
             // And the hooker's thread with the same text as a Unity text object is left to the
             // object: the object is set when the line is shown, the hooker's string functions
             // whenever the game handles the string.
-            let unity_texts: Vec<&str> = session
-                .threads
-                .iter()
-                .filter(|t| unity::is_unity(&t.hookcode) && t.count >= 2)
-                .map(|t| t.text.as_str())
-                .collect();
-            let candidates: Vec<Thread> = session
-                .threads
-                .iter()
-                .filter(|t| !t.text.is_empty() && (!unity::is_unity(&t.hookcode) || t.count >= 2))
-                .filter(|t| unity::is_unity(&t.hookcode) || !unity_texts.contains(&t.text.as_str()))
-                // The DLL reading the game's text objects, the hooker's hook on the same setter is
-                // never the better (`unity::is_hooker_tmp_setter`).
-                .filter(|t| session.unity.is_empty() || !unity::is_hooker_tmp_setter(&t.hookcode))
-                .cloned()
-                .collect();
+            let candidates = pick_candidates(&session);
             (session.source_id.clone(), session.observer_engine.clone(), candidates)
         };
         let outcome = read_screen(hook, &source_id, observer_engine.as_deref()).map(|blocks| {
-            let list: Vec<Candidate> = candidates
-                .iter()
-                .map(|t| Candidate {
-                    key: &t.key,
-                    hookcode: &t.hookcode,
-                    name: &t.name,
-                    text: &t.text,
-                    recent: t.recent_count(),
-                    count: t.count,
-                    noise: t.noisy as f64 / t.count.max(1) as f64,
-                })
-                .collect();
+            let list = as_candidates(&candidates);
             let scored = pick::score(&list, &blocks, hook.language());
             let chosen = pick::chosen(&scored, PICK_MIN_MATCH as f64, hook.language()).map(|s| s.key.clone());
             // Nothing in the language on screen: the game may show a translation of the line.
@@ -1051,7 +1180,241 @@ fn pick_loop(hook: &'static Hook, generation: u64) {
     }
 }
 
+/// Whether lines missed may drop the chosen thread without the screen's word: the window has not
+/// been read for it (no OCR, or not yet), or the last `WITNESS_UNSURE` readings could not tell
+/// while it stayed silent. Otherwise only a reading showing another thread's line moves the choice.
+fn unwitnessed(session: &Session) -> bool {
+    !session.witness_reads || session.unsure >= WITNESS_UNSURE
+}
+
+/// Has the window read to vouch for the chosen thread (`witness`), once it is drawn: the chosen
+/// thread was chosen automatically or remembered (never one the reader chose), has gone quiet,
+/// and another thread has just sent a fresh line.
+fn witness_soon(hook: &'static Hook, session: &mut Session) {
+    let silent = session
+        .threads
+        .iter()
+        .find(|t| session.selected.as_deref() == Some(t.key.as_str()))
+        .is_none_or(|t| t.last_at.is_none_or(|at| at.elapsed() >= WITNESS_SILENT));
+    let gap = if silent { WITNESS_GAP } else { session.witness_gap.unwrap_or(WITNESS_GAP) };
+    if !matches!(session.selected_by, Some("auto" | "saved"))
+        || session.witness_running
+        || session.witness_at.is_some_and(|at| at.elapsed() < gap)
+        || !hook.reading_text()
+    {
+        return;
+    }
+    session.witness_running = true;
+    session.witness_at = Some(Instant::now());
+    let generation = session.generation;
+    std::thread::spawn(move || witness_check(hook, generation));
+}
+
+fn witness_check(hook: &'static Hook, generation: u64) {
+    std::thread::sleep(PICK_DELAY);
+    let snapshot = {
+        let mut session = hook.lock();
+        let chosen = session.selected.clone().and_then(|key| {
+            let thread = session.threads.iter().find(|t| t.key == key)?;
+            // The line the chosen thread last showed, its rows joined: its own last piece can be
+            // the line's last row alone (SiglusEngine sends a row at a time), `」`, which no screen
+            // shows on its own, and the line went to another thread that had it whole.
+            let shown = session.last_line.clone().filter(|_| session.last_key.as_deref() == Some(key.as_str()));
+            Some((key.clone(), thread.count, shown.unwrap_or_else(|| thread.text.clone())))
+        });
+        match chosen {
+            Some(chosen) if session.generation == generation => {
+                let others: Vec<Thread> = pick_candidates(&session).into_iter().filter(|t| t.key != chosen.0).collect();
+                // The lines sent before the chosen thread's last: the newest is its last.
+                let earlier: Vec<String> = session.sent.iter().skip(1).cloned().collect();
+                Some((chosen, others, earlier, session.source_id.clone(), session.observer_engine.clone()))
+            }
+            _ => {
+                if session.generation == generation {
+                    session.witness_running = false;
+                }
+                None
+            }
+        }
+    };
+    let Some(((key, count, text), others, earlier, source_id, engine)) = snapshot else { return };
+    let started = Instant::now();
+    let language = hook.language();
+    let read = read_lines(hook, &source_id, engine.as_deref()).map(|lines| {
+        let title = window_title(&source_id).unwrap_or_default();
+        let blocks = witness::dialogue_blocks(&lines, &title, language);
+        let others: Vec<witness::Other> = others
+            .iter()
+            .map(|t| witness::Other {
+                key: &t.key,
+                text: &t.text,
+                generic: pick::is_generic(&t.hookcode, &t.name),
+                fresh: t.fresh,
+                count: t.count,
+            })
+            .collect();
+        let earlier: Vec<&str> = earlier.iter().map(String::as_str).collect();
+        witness::judge(&text, &earlier, &others, &blocks, language)
+    });
+    let ms = started.elapsed().as_millis() as u64;
+    let mut session = hook.lock();
+    if session.generation != generation {
+        return;
+    }
+    session.witness_running = false;
+    // The choice changed, or the chosen thread spoke, while the screen was read: the reading is of
+    // a state that has passed.
+    let current = session.selected.as_deref() == Some(key.as_str())
+        && session.threads.iter().any(|t| t.key == key && t.count == count);
+    let verdict = match read {
+        Ok(verdict) => verdict,
+        Err(e) => {
+            crate::debug_report::trace(&hook.app, json!({ "check": "texthook-witness", "error": e, "ms": ms }));
+            return;
+        }
+    };
+    crate::debug_report::trace(
+        &hook.app,
+        json!({
+            "check": "texthook-witness",
+            "verdict": verdict.name(),
+            "chosen": key,
+            "other": match &verdict { witness::Verdict::Other(k) => Some(k.as_str()), _ => None },
+            "current": current,
+            "ms": ms,
+        }),
+    );
+    session.witness_reads = true;
+    if !current {
+        return;
+    }
+    match verdict {
+        // The chosen thread's line is what the game shows: the other thread's line was not (lines
+        // ahead of the screen, a backlog), and is no line the chosen thread missed.
+        witness::Verdict::Shown | witness::Verdict::Within => {
+            session.missed = 0;
+            session.unsure = 0;
+            session.vouched = Some((key, Instant::now()));
+            session.witness_gap = Some((session.witness_gap.unwrap_or(WITNESS_GAP) * 2).min(WITNESS_MAX_GAP));
+        }
+        // Another thread has the line on screen, the chosen one does not: it takes over now, with
+        // that line, rather than after more lines are lost.
+        witness::Verdict::Other(better) => {
+            let Some(thread) = session.threads.iter().find(|t| t.key == better).cloned() else { return };
+            if let Some(exe) = session.exe.clone().filter(|_| !pick::is_generic(&thread.hookcode, &thread.name)) {
+                remember(hook, &exe, Some(thread.signature()));
+            }
+            session.dropped.push(key);
+            session.selected = Some(better.clone());
+            session.selected_by = Some("auto");
+            session.missed = 0;
+            session.unsure = 0;
+            session.witness_gap = None;
+            session.pick_note = None;
+            hook.line(&mut session, &better, &thread.text, false);
+            hook.publish(&session);
+        }
+        // Lines ahead of the screen, text nobody sent, or nothing to go by: the choice's own rules
+        // carry on.
+        witness::Verdict::Earlier | witness::Verdict::Unhooked | witness::Verdict::Unclear => {
+            session.unsure = session.unsure.saturating_add(1);
+        }
+    }
+}
+
+/// The window's title, as the source list names it: OCR reads the title bar along with the game.
+fn window_title(source_id: &str) -> Option<String> {
+    crate::sources::catalog()
+        .ok()?
+        .into_iter()
+        .find(|s| s["id"].as_str() == Some(source_id))
+        .and_then(|s| s["name"].as_str().map(String::from))
+}
+
+/// Whether the DLL reads the game's Unity text objects and one of them holds a line: then the
+/// hooker's own hook on TextMeshPro's setter, which mixes every object's text, is left alone
+/// (`unity::is_hooker_tmp_setter`). Where every object holds a character (Unity CatSystem draws
+/// its line one TextMeshPro object per glyph), the hooker's setter is the one with whole lines.
+fn dll_reads_lines(session: &Session) -> bool {
+    !session.unity.is_empty()
+        && session.threads.iter().any(|t| {
+            unity::is_unity(&t.hookcode)
+                && t.count >= 2
+                && pick::normalize(&clean::strip_markup(&t.text, false)).chars().count() > 2
+        })
+}
+
+/// The threads the screen may choose from.
+fn pick_candidates(session: &Session) -> Vec<Thread> {
+    // A Unity text object that has said one thing only is likely a label (a button, a
+    // menu): it says the same thing again and again, and is never sent twice.
+    // And the hooker's thread with the same text as a Unity text object is left to the
+    // object: the object is set when the line is shown, the hooker's string functions
+    // whenever the game handles the string.
+    let unity_texts: Vec<&str> = session
+        .threads
+        .iter()
+        .filter(|t| unity::is_unity(&t.hookcode) && t.count >= 2)
+        .map(|t| t.text.as_str())
+        .collect();
+    let dll_reads = dll_reads_lines(session);
+    session
+        .threads
+        .iter()
+        .filter(|t| !t.text.is_empty() && (!unity::is_unity(&t.hookcode) || t.count >= 2))
+        .filter(|t| unity::is_unity(&t.hookcode) || !unity_texts.contains(&t.text.as_str()))
+        // The DLL reading the game's text objects' lines, the hooker's hook on the same setter is
+        // never the better (`dll_reads_lines`).
+        .filter(|t| !dll_reads || !unity::is_hooker_tmp_setter(&t.hookcode))
+        .cloned()
+        .collect()
+}
+
+fn as_candidates(threads: &[Thread]) -> Vec<Candidate<'_>> {
+    threads
+        .iter()
+        .map(|t| Candidate {
+            key: &t.key,
+            hookcode: &t.hookcode,
+            name: &t.name,
+            text: &t.text,
+            recent: t.recent_count(),
+            count: t.count,
+            noise: t.noisy as f64 / t.count.max(1) as f64,
+        })
+        .collect()
+}
+
+/// A line another thread sent, counted against the chosen thread (`another_click`). Nothing is
+/// counted while no thread is chosen; and lines counted against an earlier choice (or while none
+/// was made) never count against a thread chosen since: carried over, the thread the screen chose
+/// again was dropped at once, its line's first row lost each time.
+fn count_missed(session: &mut Session, now: Instant) {
+    if session.missed_for != session.selected {
+        session.missed = 0;
+        session.missed_at = None;
+        session.missed_for = session.selected.clone();
+        session.unsure = 0;
+        session.witness_gap = None;
+    }
+    if session.selected.is_some() && another_click(session.missed_at, now) {
+        session.missed = session.missed.saturating_add(1);
+        session.missed_at = Some(now);
+    }
+}
+
+/// Whether a line another thread sent at `now` is from a later click than the last line counted
+/// as missed (`MISS_GAP`).
+fn another_click(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|at| now.saturating_duration_since(at) >= MISS_GAP)
+}
+
 fn read_screen(hook: &Hook, source_id: &str, engine: Option<&str>) -> Result<Vec<pick::Block>, String> {
+    read_lines(hook, source_id, engine).map(|lines| pick::blocks(&lines))
+}
+
+/// The lines the local OCR reads in the window now.
+fn read_lines(hook: &Hook, source_id: &str, engine: Option<&str>) -> Result<Vec<OcrLine>, String> {
     use kimochi_capture::TextObserver;
     let service = hook.app.state::<Shared>().inner().clone();
     let frame = crate::sources::capture_whole(&service, source_id)?;
@@ -1090,7 +1453,7 @@ fn read_screen(hook: &Hook, source_id: &str, engine: Option<&str>) -> Result<Vec
         .iter()
         .map(|l| OcrLine { text: l.text.clone(), x: l.x, y: l.y, width: l.width, height: l.height })
         .collect();
-    Ok(pick::blocks(&lines))
+    Ok(lines)
 }
 
 /// Moves to the next engine after `failed` could not be installed, started or attached.
@@ -1279,8 +1642,12 @@ pub async fn texthook_start(source_id: String, observer_engine: Option<String>) 
         };
         // A Unity (Mono) game's text is read by the voice hook DLL too, from the start: the
         // hooker reaches it, when it can, through string functions that run at all times for
-        // all sorts of strings, which tell little of when a line is shown (`unity.rs`).
-        if cfg!(windows) && targets.iter().any(|t| t.wine.is_none() && unity::is_mono_game(&t.exe)) {
+        // all sorts of strings, which tell little of when a line is shown (`unity.rs`). A Ren'Py
+        // game's dialogue likewise, from the say screen (`renpy.rs`); the hooker still runs, for
+        // the game's other text and for a Ren'Py the DLL cannot read.
+        if cfg!(windows)
+            && targets.iter().any(|t| t.wine.is_none() && (unity::is_mono_game(&t.exe) || renpy::is_renpy_game(&t.exe)))
+        {
             read_unity_text(hook, &mut session, true);
         }
         hook.publish(&session);
@@ -1474,7 +1841,8 @@ pub fn refresh_voice_hook() {
     if !enabled {
         return;
     }
-    for target in targets {
+    // A Chromium-based game: its browser process alone (its sandboxed children refuse the DLL).
+    for target in process::voice_targets(&targets, process::is_chromium_dir) {
         if !service.hook_attempt(target.pid) {
             continue;
         }
@@ -1552,7 +1920,52 @@ fn inject_voice_dll(app: &tauri::AppHandle, target: &process::Target) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::failed_hook;
+    use super::{another_click, count_missed, failed_hook, unwitnessed, Session, MISS_GAP, WITNESS_UNSURE};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn one_clicks_lines_from_other_threads_are_one_missed_line() {
+        let t = Instant::now();
+        assert!(another_click(None, t));
+        // The same line's other forms, from other threads, moments later.
+        assert!(!another_click(Some(t), t + Duration::from_millis(300)));
+        assert!(!another_click(Some(t), t + MISS_GAP - Duration::from_millis(1)));
+        // The next click's line.
+        assert!(another_click(Some(t), t + MISS_GAP));
+    }
+
+    #[test]
+    fn a_thread_the_screen_can_vouch_for_is_not_dropped_blind() {
+        let mut session = Session::default();
+        // No reading yet (or no OCR): missed lines decide, as before.
+        assert!(unwitnessed(&session));
+        session.witness_reads = true;
+        assert!(!unwitnessed(&session));
+        // Readings that could not tell, the thread silent through them all.
+        session.unsure = WITNESS_UNSURE - 1;
+        assert!(!unwitnessed(&session));
+        session.unsure = WITNESS_UNSURE;
+        assert!(unwitnessed(&session));
+    }
+
+    #[test]
+    fn lines_are_missed_by_the_thread_chosen_when_they_came() {
+        let t = Instant::now();
+        let click = |n: u32| t + MISS_GAP * n;
+        let mut session = Session::default();
+        // No thread chosen: nothing is missed.
+        count_missed(&mut session, click(0));
+        count_missed(&mut session, click(1));
+        assert_eq!(session.missed, 0);
+        session.selected = Some("a".into());
+        count_missed(&mut session, click(2));
+        count_missed(&mut session, click(3));
+        assert_eq!(session.missed, 2);
+        // Chosen again (or another chosen): it starts with none missed.
+        session.selected = Some("b".into());
+        count_missed(&mut session, click(4));
+        assert_eq!(session.missed, 1);
+    }
 
     #[test]
     fn a_hook_the_hooker_could_not_insert_is_told_apart() {

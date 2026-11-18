@@ -253,7 +253,9 @@ pub fn score(candidates: &[Candidate], blocks: &[Block], language: &Language) ->
     let mut scored: Vec<Scored> = candidates
         .iter()
         .filter_map(|candidate| {
-            let text = normalize(candidate.text);
+            // Markup aside: a Unity TextMeshPro object's text carries its colour and alignment
+            // (`<color=#ffffffff><align="center">…`), which the screen never shows.
+            let text = normalize(&super::clean::strip_markup(candidate.text, false));
             let length = text.chars().count();
             // Too short to tell apart, or not the language: file paths, asset names and the window
             // title also turn up in hooked threads and on screen. In a language that spaces its
@@ -755,6 +757,14 @@ fn same_but_breaks(sentence: &[char], rest: &[char]) -> Option<usize> {
     None
 }
 
+/// Whether `shown` (normalized) is the line `chosen` (normalized) has shown, sent again by another
+/// thread: the same text, a piece of it, or it with more around it (a thread that keeps the box's
+/// earlier text). A short line is no sign: `はい` is in many lines that follow it.
+pub fn same_line(chosen: &str, shown: &str) -> bool {
+    const SHORT: usize = 6;
+    !shown.is_empty() && chosen.chars().count() >= SHORT && (chosen.contains(shown) || shown.contains(chosen))
+}
+
 /// Whether `shown` (normalized) is a line of dialogue other than `before`: in the language, `min`
 /// characters or more, and not `before` typed further or the start of it.
 pub fn another_line(before: &str, shown: &str, min: usize, language: &Language) -> bool {
@@ -1026,6 +1036,20 @@ mod tests {
     }
 
     #[test]
+    fn a_line_the_chosen_thread_showed_is_the_same_line_from_another_thread() {
+        let line = normalize("「それほど楽な仕事ではない」");
+        assert!(same_line(&line, &line));
+        // A thread that keeps the box's earlier text, or one with only part of it.
+        assert!(same_line(&line, &normalize("仕事ではない」　　　「それほど楽な仕事ではない」")));
+        assert!(same_line(&line, &normalize("それほど楽な")));
+        // The next line is another.
+        assert!(!same_line(&line, &normalize("町の人たちには頼りにされている。")));
+        assert!(!same_line("", &line));
+        // A short line is in many that follow it.
+        assert!(!same_line(&normalize("はい"), &normalize("はい、そうです。それで構いません")));
+    }
+
+    #[test]
     fn a_script_going_through_string_functions_is_left_as_it_is_and_quickly() {
         // A script interpreter's source, tens of thousands of characters with a bracket on every line.
         let script = "if⏎(_EXITCODE_==4)⏎next⏎".repeat(2_000);
@@ -1086,6 +1110,24 @@ mod tests {
         ];
         let scored = score(&candidates, &blocks(&screen), ja());
         assert_eq!(scored[0].key, "set_text");
+    }
+
+    #[test]
+    fn a_text_objects_markup_is_not_held_against_it() {
+        // A Unity TextMeshPro object's text, with the colour and alignment it is drawn with.
+        let object = "<color=#ffffffff><align=\"center\">……静かな夜の中で、扉が開いた……</align>";
+        let candidates = [Candidate {
+            key: "object",
+            hookcode: "UNITY:TMP_Text.set_text",
+            name: "TMP_Text",
+            text: object,
+            recent: 1,
+            count: 3,
+            noise: 0.0,
+        }];
+        let screen = [line("……静かな夜の中で、扉が開いた……", 600.0, 500.0, 700.0, 32.0)];
+        let scored = score(&candidates, &blocks(&screen), ja());
+        assert_eq!(chosen(&scored, 6.0, ja()).map(|s| s.key.as_str()), Some("object"));
     }
 
     #[test]
