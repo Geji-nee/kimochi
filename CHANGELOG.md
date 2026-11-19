@@ -8,6 +8,10 @@ Headings inside a version are optional: `### Added`, `### Changed`, `### Fixed`,
 
 ## [Unreleased]
 
+### Fixed
+
+- **Linux: Text hooking and Audio hooking now work with older Wine,** such as Wine 8 (for example an older Flathub Wine on the Steam Deck). Before, they failed with "found no programs in the Wine prefix". If a game's Wine is too old even for this, Kimochi says so and links to how to update Wine. Audio hooking also no longer reports success when it couldn't start in a Flatpak sandbox.
+
 ## [1.1.0] - 2026-11-18
 
 ### Added

@@ -201,15 +201,78 @@ pub fn prefix_arch(system_reg: &str) -> Option<&str> {
     system_reg.lines().take(20).find_map(|l| l.trim().strip_prefix("#arch=")).map(str::trim)
 }
 
-/// Why the game was not found among what the helper listed, for the person hooking it. The
-/// helper may not have run at all: Wine reports an exe it cannot start (`Bad EXE format`) on
-/// stdout, not stderr, and exits with an error, so both are looked at, not only stderr.
+/// The Flatpak app a sandboxed game runs in, with its branch (`org.winehq.Wine stable-22.08`),
+/// from the sandbox's `/.flatpak-info`. Flathub's Wine keeps one Wine release per branch, so the
+/// branch says which Wine the game has.
+#[cfg(any(target_os = "linux", test))]
+pub fn flatpak_app(info: &str) -> Option<String> {
+    let mut section = "";
+    let (mut name, mut branch) = (None, None);
+    for line in info.lines().map(str::trim) {
+        if line.starts_with('[') {
+            section = line;
+        } else if let Some((key, value)) = line.split_once('=') {
+            match (section, key.trim()) {
+                ("[Application]", "name") => name = Some(value.trim()),
+                ("[Instance]", "branch") => branch = Some(value.trim()),
+                _ => {}
+            }
+        }
+    }
+    Some(match branch.filter(|b| !b.is_empty()) {
+        Some(branch) => format!("{} {branch}", name?),
+        None => name?.to_string(),
+    })
+}
+
+/// What Wine's loader could not give the helper, from its `err:module` lines: the DLL it lacks
+/// (`import_dll Library X.dll (which is needed by …) not found`), else the function
+/// (`No implementation for X.dll.F imported from …`), else that it failed. Wine releases
+/// gain DLLs and functions, so on a Wine too old for the helper this is what goes missing. (Wine
+/// before 8.14 lacks `bcryptprimitives.dll`, which Kimochi ships a stand-in for; see
+/// `hookd/shim/`.)
+#[cfg(any(target_os = "linux", test))]
+fn missing_from_wine(output: &str) -> Option<String> {
+    let lines: Vec<&str> = output.lines().map(str::trim).filter(|l| l.contains("err:module:")).collect();
+    let after = |l: &str, start: &str, end: &str| -> Option<String> {
+        let rest = &l[l.find(start)? + start.len()..];
+        Some(rest[..rest.find(end)?].trim().to_string())
+    };
+    if lines.is_empty() {
+        return None;
+    }
+    lines
+        .iter()
+        .find_map(|l| after(l, "Library ", " (").filter(|_| l.contains("not found")))
+        .or_else(|| lines.iter().find_map(|l| after(l, "No implementation for ", " imported")))
+        .or_else(|| Some(String::new()))
+}
+
+/// Where someone whose Wine is too old finds how to update it (WineHQ's download page, with
+/// instructions for each distribution; `wiki.winehq.org/Download` redirects here).
+pub const WINE_UPDATE_URL: &str = "https://gitlab.winehq.org/wine/wine/-/wikis/Download";
+
+/// How a reason from `not_found_reason` that comes down to an old Wine begins, so the card can
+/// offer `WINE_UPDATE_URL` with it.
+pub const OLD_WINE: &str = "Kimochi's hook helper could not start with this game's Wine";
+
+/// Whether a failed start's reason is an old Wine, for the card's link to `WINE_UPDATE_URL`.
+pub fn needs_newer_wine(reason: &str) -> bool {
+    reason.starts_with(OLD_WINE)
+}
+
+/// Why the game was not found among what the helper listed, for the person hooking it.
+///
+/// The helper always lists itself, so an empty list means it never ran. Its exit status cannot
+/// tell: `flatpak enter` exits 0 whatever the program it ran did. Wine reports an exe it cannot
+/// start (`Bad EXE format`) on stdout, a program it cannot load (a DLL it lacks) on stderr as a
+/// `err:module` line, so both are looked at. `sandbox` names a Flatpak the game runs in.
 #[cfg(any(target_os = "linux", test))]
 pub fn not_found_reason(
     image: &str,
     prefix: &Path,
     listed: &[Listed],
-    success: bool,
+    sandbox: Option<&str>,
     stdout: &str,
     stderr: &str,
 ) -> String {
@@ -226,11 +289,19 @@ pub fn not_found_reason(
             .next_back()
     };
     if listed.is_empty() {
-        let what = said(stderr).or_else(|| said(stdout));
-        return match (what, success) {
-            (Some(what), _) => format!("Could not run the hook helper with the game's Wine: {what}"),
-            (None, false) => "Could not run the hook helper with the game's Wine (it exited with an error and said nothing). Turn on verbose logging and send a debug report.".into(),
-            (None, true) => format!("The hook helper found no programs in the Wine prefix {}.", prefix.display()),
+        if let Some(missing) = missing_from_wine(stderr).or_else(|| missing_from_wine(stdout)) {
+            let wine = sandbox.map(|app| format!(" (the {app} Flatpak)")).unwrap_or_default();
+            let lacks = if missing.is_empty() { String::new() } else { format!(", which has no {missing}") };
+            return format!(
+                "{OLD_WINE}{wine}{lacks}. This Wine is probably too old: update it (for Flathub's Wine, install a newer branch of it), or run the game with a recent Proton."
+            );
+        }
+        return match said(stderr).or_else(|| said(stdout)) {
+            Some(what) => format!("Could not run the hook helper with the game's Wine: {what}"),
+            None => format!(
+                "Could not run the hook helper with the game's Wine in {} (it said nothing). Turn on verbose logging and send a debug report.",
+                prefix.display()
+            ),
         };
     }
     format!(
@@ -477,9 +548,13 @@ mod imp {
         Ok(())
     }
 
+    const WINEDEBUG: &str = "-all,err+module";
+
     /// Starts a Windows program with the game's Wine, in its prefix. The caller's own library
     /// path (Kimochi's AppImage bundles its own libraries) must not reach Wine, nor `flatpak`.
-    /// `program` must be one the game can reach (`reachable`).
+    /// `program` must be one the game can reach (`reachable`). Wine's debug output is off except
+    /// the loader's errors, which are how Wine says it could not load the program at all (a DLL
+    /// it lacks); without them a program that never started looks like one that printed nothing.
     pub fn command(wine: &Wine, program: &Path) -> Command {
         let mut command = Command::new(match wine.flatpak {
             Some(_) => Path::new("flatpak"),
@@ -495,7 +570,9 @@ mod imp {
                 for key in PROCESS_ONLY.iter().chain(&["LD_PRELOAD"]) {
                     command.args(["-u", key]);
                 }
-                command.arg(format!("WINEPREFIX={}", wine.prefix.to_string_lossy())).arg("WINEDEBUG=-all");
+                command
+                    .arg(format!("WINEPREFIX={}", wine.prefix.to_string_lossy()))
+                    .arg(format!("WINEDEBUG={WINEDEBUG}"));
                 command.args(wine.env.iter().map(|(k, v)| format!("{k}={v}")));
                 command.arg(&wine.binary);
             }
@@ -509,7 +586,7 @@ mod imp {
                 }
                 command
                     .env("WINEPREFIX", &wine.prefix)
-                    .env("WINEDEBUG", "-all")
+                    .env("WINEDEBUG", WINEDEBUG)
                     .envs(wine.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
             }
         }
@@ -562,6 +639,10 @@ mod imp {
         let stderr = errors.join().unwrap_or_default();
         let listed = parse_listing(&stdout);
         let found = pick(&listed, &wine.image);
+        let sandbox = wine
+            .flatpak
+            .and_then(|pid| std::fs::read_to_string(in_root(pid, Path::new("/.flatpak-info"))).ok())
+            .and_then(|info| flatpak_app(&info));
         // What was asked and what came back, for a debug report (verbose logging): which Wine and
         // prefix, the image looked for, and every program the helper saw there.
         let tail = |text: &str| -> Vec<String> {
@@ -574,8 +655,10 @@ mod imp {
             "wine": wine.binary,
             "prefix": wine.prefix,
             "flatpak": wine.flatpak.is_some(),
+            "sandbox": sandbox,
             "image": wine.image,
             "helper": windows_path(&hookd),
+            // Not the helper's under Flatpak: `flatpak enter` exits 0 whatever it ran did.
             "exit": status.code(),
             "listed": listed.iter().map(|p| serde_json::json!({ "pid": p.pid, "parent": p.parent, "name": p.name, "path": p.path, "bits": p.bits })).collect::<Vec<_>>(),
             "found": found.iter().map(|p| p.pid).collect::<Vec<_>>(),
@@ -583,7 +666,7 @@ mod imp {
             "stderr": tail(&stderr),
         }));
         if found.is_empty() {
-            return Err(not_found_reason(&wine.image, &wine.prefix, &listed, status.success(), &stdout, &stderr));
+            return Err(not_found_reason(&wine.image, &wine.prefix, &listed, sandbox.as_deref(), &stdout, &stderr));
         }
         Ok(found
             .into_iter()
@@ -713,29 +796,85 @@ not json"#;
         let image = "Z:\\home\\deck\\Games\\VN\\Game.exe";
         // A 64-bit helper in a 32-bit prefix (Wine 11, live): exit 1, the reason on stdout only.
         let stdout = "Application could not be started, or no application associated with the specified file.\nShellExecuteEx failed: Bad EXE format for Z:\\x\\kimochi-hookd-x64.exe.\n\n";
-        let reason = not_found_reason(image, prefix, &[], false, stdout, "");
+        let reason = not_found_reason(image, prefix, &[], None, stdout, "");
         assert!(reason.contains("Bad EXE format"), "{reason}");
         // The helper's own error event, and stderr ahead of stdout.
         let reason = not_found_reason(
             image,
             prefix,
             &[],
-            false,
+            None,
             "{\"event\":\"error\",\"text\":\"could not list processes\"}",
             "",
         );
         assert!(reason.ends_with("could not list processes"), "{reason}");
-        assert!(not_found_reason(image, prefix, &[], false, "noise", "wine: cannot find L\"x.exe\"")
+        assert!(not_found_reason(image, prefix, &[], None, "noise", "wine: cannot find L\"x.exe\"")
             .ends_with("cannot find L\"x.exe\""));
-        assert!(not_found_reason(image, prefix, &[], false, "", "").contains("said nothing"));
+        // Nothing at all (exit 0 under `flatpak enter` whatever happened): it did not run, which is
+        // not the same as an empty prefix.
+        let reason = not_found_reason(image, prefix, &[], None, "", "");
+        assert!(reason.contains("said nothing") && reason.contains("/var/data/wine"), "{reason}");
         // It ran and listed programs, none of them the game: the prefix it looked in is named.
         let listed = parse_listing(
             r#"{"bits":64,"event":"process","name":"services.exe","parent":0,"path":"C:\\windows\\system32\\services.exe","pid":32}"#,
         );
-        let reason = not_found_reason(image, prefix, &listed, true, "", "");
+        let reason = not_found_reason(image, prefix, &listed, None, "", "");
         assert!(
             reason.starts_with("Game.exe is not running in the Wine prefix Kimochi checked (/var/data/wine;"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn a_wine_too_old_for_the_helper_says_so() {
+        let prefix = Path::new("/var/data/wine");
+        let image = "Z:\\home\\deck\\Downloads\\mla\\Muv-Luv_Alternative16.exe";
+        // Flathub's Wine stable-22.08 (Wine 8.0.2), live, with the loader's errors kept.
+        let stderr = r#"0128:err:module:import_dll Library bcryptprimitives.dll (which is needed by L"Z:\\var\\data\\wine\\drive_c\\users\\deck\\AppData\\Local\\kimochi-texthook\\hookd-0\\kimochi-hookd-x64.exe") not found
+0128:err:module:LdrInitializeThunk Importing dlls for L"Z:\\var\\data\\wine\\drive_c\\users\\deck\\AppData\\Local\\kimochi-texthook\\hookd-0\\kimochi-hookd-x64.exe" failed, status c0000135
+"#;
+        let reason = not_found_reason(image, prefix, &[], Some("org.winehq.Wine stable-22.08"), "", stderr);
+        assert_eq!(
+            reason,
+            "Kimochi's hook helper could not start with this game's Wine (the org.winehq.Wine stable-22.08 Flatpak), which has no bcryptprimitives.dll. This Wine is probably too old: update it (for Flathub's Wine, install a newer branch of it), or run the game with a recent Proton."
+        );
+        assert!(needs_newer_wine(&reason));
+        let reason = not_found_reason(image, prefix, &[], None, "", stderr);
+        assert!(
+            reason.starts_with(
+                "Kimochi's hook helper could not start with this game's Wine, which has no bcryptprimitives.dll."
+            ),
+            "{reason}"
+        );
+        // A function it lacks, and a failure that names neither.
+        let reason = not_found_reason(image, prefix, &[], None, "", "0130:err:module:import_dll No implementation for kernel32.dll.GetSystemTimePreciseAsFileTime imported from L\"Z:\\x.exe\", setting to 0xdeadbeef\n");
+        assert!(reason.contains("which has no kernel32.dll.GetSystemTimePreciseAsFileTime."), "{reason}");
+        let reason = not_found_reason(
+            image,
+            prefix,
+            &[],
+            None,
+            "",
+            "0128:err:module:LdrInitializeThunk Importing dlls for L\"x\" failed, status c0000135\n",
+        );
+        assert!(
+            reason.starts_with("Kimochi's hook helper could not start with this game's Wine. This Wine"),
+            "{reason}"
+        );
+        // Anything else Wine says is passed on as it is, and is not an old Wine.
+        let reason =
+            not_found_reason(image, prefix, &[], None, "", "wine: could not load kernel32.dll, status c0000135");
+        assert!(!needs_newer_wine(&reason) && reason.ends_with("status c0000135"), "{reason}");
+    }
+
+    #[test]
+    fn a_sandbox_is_named_by_its_app_and_branch() {
+        let info = "[Application]\nname=org.winehq.Wine\nruntime=runtime/org.freedesktop.Platform/x86_64/22.08\n\n[Instance]\ninstance-id=1437540275\nbranch=stable-22.08\narch=x86_64\n\n[Context]\nshared=network;ipc;\n";
+        assert_eq!(flatpak_app(info).as_deref(), Some("org.winehq.Wine stable-22.08"));
+        assert_eq!(
+            flatpak_app("[Application]\nname=com.usebottles.bottles\n").as_deref(),
+            Some("com.usebottles.bottles")
+        );
+        assert_eq!(flatpak_app("[Instance]\nbranch=stable\n"), None);
     }
 }
